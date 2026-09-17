@@ -1,0 +1,95 @@
+name: AnkiVoice
+options:
+  bundleIdPrefix: local.ankivoice
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    TARGETED_DEVICE_FAMILY: "1"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: KQHSQY486C
+    CODE_SIGN_IDENTITY: "Apple Development"
+    ENABLE_USER_SCRIPT_SANDBOXING: "YES"
+    CURRENT_PROJECT_VERSION: "16"
+    MARKETING_VERSION: "0.2.0"
+    DEVELOPMENT_LANGUAGE: en
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+targets:
+  AnkiVoice:
+    type: application
+    platform: iOS
+    sources:
+      - path: App/Sources
+      - path: App/Resources
+        optional: true
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: AnkiVoice
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        UIBackgroundModes:
+          - audio
+        NSMicrophoneUsageDescription: "Your microphone is used during hands-free study so the app can detect answers and voice commands. Audio never leaves your device."
+        NSSpeechRecognitionUsageDescription: "Speech recognition runs on-device to recognize your spoken answers and commands like Again, Hard, Good, and Easy."
+        NSLocalNetworkUsageDescription: "AnkiVoice connects to Anki on your computer over your local network to import decks through the AnkiConnect add-on."
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        ITSAppUsesNonExemptEncryption: false
+        NSPrivacyAccessedAPITypes:
+          - NSPrivacyAccessedAPIType: NSPrivacyAccessedAPICategoryUserDefaults
+            NSPrivacyAccessedAPIReasonReasons:
+              - CA92.1
+          - NSPrivacyAccessedAPIType: NSPrivacyAccessedAPICategoryFileTimestamp
+            NSPrivacyAccessedAPIReasonReasons:
+              - C617.1
+        UIRequiresFullScreen: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hyperbox.ankivoice
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: "YES"
+        SWIFT_OBJC_BRIDGING_HEADER: App/Sources/Support/AnkiVoice-Bridging-Header.h
+  AnkiVoiceTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: AnkiVoice
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: local.ankivoice.tests
+  AnkiVoiceUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - path: UITests
+    dependencies:
+      - target: AnkiVoice
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: local.ankivoice.uitests
+        TEST_TARGET_NAME: AnkiVoice
+schemes:
+  AnkiVoice:
+    build:
+      targets:
+        AnkiVoice: all
+        AnkiVoiceTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - AnkiVoiceTests
+        - AnkiVoiceUITests
