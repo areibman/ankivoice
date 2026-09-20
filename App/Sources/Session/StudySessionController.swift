@@ -38,6 +38,11 @@ public final class StudySessionController {
     private let reviews: ReviewRepository
     private let queue: StudyQueue
     private let renderer = SpeechRenderer()
+    /// Scheduled, keep-going, or a filtered deck. Set before `start`.
+    public var gather: StudyQueue.Gather = .scheduled
+    /// Review cards already answered in a keep-going session, so the same card
+    /// does not come straight back just because it is now the soonest future due.
+    private var sessionHold: Set<Int64> = []
     private let recognizer = CommandRecognizer()
     public let settings: SettingsStore
 
@@ -52,10 +57,10 @@ public final class StudySessionController {
     public private(set) var voiceAvailable = true
     public private(set) var deck: Deck?
     public private(set) var currentCard: StudyCard?
-    public private(set) var rendered: SpeechRenderer.RenderedCard?
+    private var rendered: SpeechRenderer.RenderedCard?
+    /// What the recognizer heard in the current listening window, shown on
+    /// screen as feedback. Kept in memory only.
     public private(set) var transcript: String = ""
-    /// The user's spoken answer, accumulated during the answer phase.
-    public private(set) var answerTranscript: String = ""
     public private(set) var remaining: StudyQueue.Remaining = .init()
     public private(set) var sessionLog: [SessionEntry] = []
     public private(set) var statusMessage: String?
@@ -131,11 +136,15 @@ public final class StudySessionController {
         touchInteractions = 0
         sessionLog = []
         skipSet = []
+        sessionHold = []
         lastUndoRecord = nil
         statusMessage = nil
 
         let configs = (try? decks.config(for: deck.id)) ?? (StudyConfig(), VoiceConfig(), nil)
         studyConfig = configs.0
+        if let spec = try? decks.filteredSpec(for: deck.id) {
+            gather = .filtered(reschedule: spec.reschedule)
+        }
         voiceConfig = resolved(configs.1)
 
         do {
@@ -161,17 +170,21 @@ public final class StudySessionController {
     private func resolved(_ config: VoiceConfig) -> VoiceConfig {
         var result = config
         if result.questionVoice == nil {
-            result.questionVoice = settings.defaultVoice(forLocale: config.questionLocale)
+            result.questionVoice = settings.effectiveDefaultVoice(forLocale: config.questionLocale)
         }
         if result.answerVoice == nil {
-            result.answerVoice = settings.defaultVoice(forLocale: config.answerLocale)
+            result.answerVoice = settings.effectiveDefaultVoice(forLocale: config.answerLocale)
         }
         if result.usesDefaultSpeechRate {
             result.speechRate = settings.speechRate
         }
-        result.preferredQuality = settings.voiceQuality
+        result.languageVoices = settings.defaultVoices
         return result
     }
+
+    /// Locales the card face uses so the "Read aloud" text matches speech.
+    public var questionLocale: String { voiceConfig.questionLocale }
+    public var answerLocale: String { voiceConfig.answerLocale }
 
     /// Voice for app prompts ("Session paused", intervals): the user's default
     /// English voice at the global speed.
@@ -231,14 +244,22 @@ public final class StudySessionController {
 
     // MARK: - Card flow
 
+    /// Continues past today's limits into future reviews and leftover new cards.
+    public func keepStudying() async {
+        gather = .more
+        state = .loadingCard
+        await loadNextCard()
+    }
+
     private func loadNextCard() async {
         state = .loadingCard
         transcript = ""
-        answerTranscript = ""
         hintGivenForCurrentCard = false
 
         let deckID = deck?.id ?? 0
-        if let card = try? queue.next(forDeck: deckID, config: studyConfig, exclude: skipSet) {
+        var excluded = skipSet
+        if case .more = gather { excluded.formUnion(sessionHold) }
+        if let card = try? queue.next(forDeck: deckID, config: studyConfig, exclude: excluded, gather: gather) {
             currentCard = card
             cardShownAt = Date()
             rendered = renderer.render(
@@ -278,11 +299,6 @@ public final class StudySessionController {
 
     private func speakAnswer() async {
         guard let rendered, let engine else { return }
-        // Keep the user's spoken answer; from here on the transcript holds
-        // rating-phase speech ("repeat", a hint-worthy mumble), not the answer.
-        if !transcript.isEmpty {
-            answerTranscript = transcript
-        }
         state = .speakingAnswer
         lastSpokenSide = .answer
         await engine.speak(rendered.answer, voice: voiceConfig.speaking(.answer))
@@ -463,8 +479,12 @@ public final class StudySessionController {
         engine?.stopListening()
         state = .processingRating
 
+        let parameters = studyConfig.parameters ?? settings.fsrsParameters ?? FSRSScheduler.defaultParameters
         let scheduler = FSRSScheduler(
+            parameters: parameters,
             desiredRetention: studyConfig.desiredRetention,
+            learningSteps: studyConfig.learningSteps,
+            relearningSteps: studyConfig.relearningSteps,
             maximumInterval: studyConfig.maximumIntervalDays,
             enableFuzzing: false
         )
@@ -473,15 +493,33 @@ public final class StudySessionController {
             card.card.scheduling.memoryState, rating: rating, at: Date()
         )
 
-        // Fuzz applies only to day-level review intervals (PRD §30).
+        // Day-scale intervals use Anki's load balancer inside the fuzz window.
+        // Shorter intervals, and anything past 90 days, fall back to plain fuzz.
         var finalInterval = intervalSeconds
         if memory.state == .review && intervalSeconds >= 86_400 {
-            let fuzzedDays = FSRSScheduler(
-                desiredRetention: studyConfig.desiredRetention,
-                maximumInterval: studyConfig.maximumIntervalDays,
-                enableFuzzing: true
-            ).applyFuzz(toIntervalDays: Int(intervalSeconds / 86_400))
-            finalInterval = TimeInterval(fuzzedDays) * 86_400
+            let days = Int(intervalSeconds / 86_400)
+            let counts = (try? cards.reviewCountsByDay(days: FSRSLoadBalancer.maxInterval + 10)) ?? []
+            let siblings = (try? cards.siblingDueDayOffsets(noteID: card.note.id, excluding: card.id)) ?? []
+            if let balanced = FSRSLoadBalancer.select(
+                intervalDays: days,
+                maximumDays: studyConfig.maximumIntervalDays,
+                dueCounts: counts,
+                easyDays: studyConfig.easyDays,
+                siblingDayOffsets: siblings,
+                seed: UInt64(bitPattern: Int64(card.id))
+            ) {
+                finalInterval = TimeInterval(balanced) * 86_400
+            } else {
+                let fuzzedDays = FSRSScheduler(
+                    parameters: parameters,
+                    desiredRetention: studyConfig.desiredRetention,
+                    learningSteps: studyConfig.learningSteps,
+                    relearningSteps: studyConfig.relearningSteps,
+                    maximumInterval: studyConfig.maximumIntervalDays,
+                    enableFuzzing: true
+                ).applyFuzz(toIntervalDays: days)
+                finalInterval = TimeInterval(fuzzedDays) * 86_400
+            }
         }
 
         var newScheduling = SchedulingState(memory: memory)
@@ -497,11 +535,20 @@ public final class StudySessionController {
         )
 
         do {
-            try cards.replaceScheduling(newScheduling, cardID: card.id)
-            let persisted = try reviews.append(log)
-            lastUndoRecord = UndoRecord(
-                logID: persisted.id, cardID: card.id, previousScheduling: previous
-            )
+            if gather.reschedules {
+                try cards.replaceScheduling(newScheduling, cardID: card.id)
+                let persisted = try reviews.append(log)
+                lastUndoRecord = UndoRecord(
+                    logID: persisted.id, cardID: card.id, previousScheduling: previous
+                )
+                try cards.burySiblings(of: card.card, config: studyConfig)
+                if case .more = gather, newScheduling.kind == .review {
+                    sessionHold.insert(card.id)
+                }
+            }
+            if card.card.originalDeckID != nil {
+                try cards.returnFromFiltered(card.id)
+            }
             try? decks.markStudied(deck.id)
         } catch {
             state = .idle
@@ -513,7 +560,9 @@ public final class StudySessionController {
         if mode == .voice { voiceReviews += 1 } else { touchReviews += 1 }
         sessionLog.append(
             SessionEntry(
-                timestamp: Date(), cardFront: card.note.front, rating: rating,
+                timestamp: Date(),
+                cardFront: rendered.map { SpeechRenderer.plainText(of: $0.question) } ?? card.note.front,
+                rating: rating,
                 mode: mode, intervalDays: Int(finalInterval / 86_400)
             )
         )
@@ -540,12 +589,19 @@ public final class StudySessionController {
     }
 
     /// Reveals the answer without requiring a spoken response.
+    ///
+    /// Also valid while the question is still being read. Touch study has no
+    /// other way to flip the card until that reading finishes.
     public func reveal(mode: StudyMode) async {
-        guard state == .awaitingAnswer || state == .answerInProgress else { return }
+        guard state == .speakingPrompt || state == .awaitingAnswer || state == .answerInProgress else { return }
         if mode == .touch { touchInteractions += 1 }
         answerTimeoutTask?.cancel()
-        engine?.stopListening()
+        // Set the state before stopping speech. `speakPrompt` is still
+        // suspended in `speak`; when that returns it must not open the
+        // microphone on top of the answer.
         state = .answerComplete
+        engine?.stopListening()
+        engine?.stopSpeaking()
         await speakAnswer()
     }
 
@@ -706,12 +762,8 @@ public final class StudySessionController {
 
     // MARK: - Helpers
 
-    private var effectiveEndpointMs: Int {
-        // A deck-level override wins when it deviates from the default;
-        // otherwise the global endpoint profile applies.
-        if voiceConfig.endpointDelayMs != 700 { return voiceConfig.endpointDelayMs }
-        return settings.endpointProfile.silenceMs
-    }
+    /// Silence after the user's answer before the turn ends (Settings → Response speed).
+    private var effectiveEndpointMs: Int { settings.endpointProfile.silenceMs }
 
     private func speakNotice(_ text: String) async {
         await engine?.speak([.speech(text: text, locale: "en-US")], voice: noticeVoice)

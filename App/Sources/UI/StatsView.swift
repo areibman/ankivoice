@@ -9,6 +9,7 @@ struct StatsView: View {
     @State private var streak = 0
     @State private var collection: StatsStore.CollectionStats = .init()
     @State private var handsFree: StatsStore.HandsFreeStats = .init()
+    @State private var graphs = AnkiGraphs()
     @State private var range: HistoryRange = .month
 
     enum HistoryRange: Int, CaseIterable, Identifiable {
@@ -30,6 +31,7 @@ struct StatsView: View {
                 historySection
                 handsFreeSection
                 collectionSection
+                AnkiGraphSections(graphs: graphs)
             }
             .navigationTitle("Stats")
             .task { await load() }
@@ -168,6 +170,7 @@ struct StatsView: View {
         streak = (try? services.stats.streak()) ?? 0
         collection = (try? services.stats.collectionStats()) ?? .init()
         handsFree = (try? services.stats.handsFree()) ?? .init()
+        graphs = (try? AnkiGraphs.compute(cards: services.cards, reviews: services.reviews)) ?? AnkiGraphs()
     }
 
     // MARK: Pieces

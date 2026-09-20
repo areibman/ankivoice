@@ -2,7 +2,7 @@ import Foundation
 
 /// Database schema creation and migration.
 public enum Schema {
-    public static let version = 2
+    public static let version = 5
 
     public static func migrate(db: SQLiteDatabase) throws {
         try db.transaction {
@@ -16,6 +16,15 @@ public enum Schema {
             if current < 2 {
                 try migrateV2(db: db)
             }
+            if current < 3 {
+                try migrateV3(db: db)
+            }
+            if current < 4 {
+                try migrateV4(db: db)
+            }
+            if current < 5 {
+                try migrateV5(db: db)
+            }
 
             try db.run("PRAGMA user_version = \(version)")
         }
@@ -26,6 +35,61 @@ public enum Schema {
         let columns = try db.query("PRAGMA table_info(decks)") { $0.string(1) }
         if !columns.contains("use_default_speech_rate") {
             try db.execute("ALTER TABLE decks ADD COLUMN use_default_speech_rate INTEGER NOT NULL DEFAULT 1;")
+        }
+    }
+
+    /// v3: drops settings that never had a UI. The answer pause is the
+    /// global "Response speed" setting; semantic grading never shipped.
+    /// The `meta` key/value table was never read or written.
+    private static func migrateV3(db: SQLiteDatabase) throws {
+        let columns = try db.query("PRAGMA table_info(decks)") { $0.string(1) }
+        for column in ["endpoint_delay_ms", "semantic_grading_enabled"] where columns.contains(column) {
+            try db.execute("ALTER TABLE decks DROP COLUMN \(column);")
+        }
+        try db.execute("DROP TABLE IF EXISTS meta;")
+    }
+
+    /// v4: bury, filtered decks, per-deck FSRS options used by Anki's scheduler.
+    private static func migrateV4(db: SQLiteDatabase) throws {
+        let cardColumns = try db.query("PRAGMA table_info(cards)") { $0.string(1) }
+        if !cardColumns.contains("buried") {
+            try db.execute("ALTER TABLE cards ADD COLUMN buried INTEGER NOT NULL DEFAULT 0;")
+        }
+        if !cardColumns.contains("buried_until") {
+            try db.execute("ALTER TABLE cards ADD COLUMN buried_until REAL;")
+        }
+        if !cardColumns.contains("original_deck_id") {
+            try db.execute("ALTER TABLE cards ADD COLUMN original_deck_id INTEGER REFERENCES decks(id) ON DELETE SET NULL;")
+        }
+        if !cardColumns.contains("filter_position") {
+            try db.execute("ALTER TABLE cards ADD COLUMN filter_position INTEGER;")
+        }
+
+        let deckColumns = try db.query("PRAGMA table_info(decks)") { $0.string(1) }
+        let additions: [(String, String)] = [
+            ("kind", "INTEGER NOT NULL DEFAULT 0"),
+            ("bury_new", "INTEGER NOT NULL DEFAULT 1"),
+            ("bury_reviews", "INTEGER NOT NULL DEFAULT 0"),
+            ("bury_interday", "INTEGER NOT NULL DEFAULT 1"),
+            ("filter_query", "TEXT"),
+            ("filter_limit", "INTEGER NOT NULL DEFAULT 100"),
+            ("filter_order", "INTEGER NOT NULL DEFAULT 0"),
+            ("reschedule", "INTEGER NOT NULL DEFAULT 1"),
+            ("fsrs_parameters", "TEXT"),
+            ("easy_days", "TEXT NOT NULL DEFAULT '[1,1,1,1,1,1,1]'"),
+            ("learn_steps", "TEXT NOT NULL DEFAULT '[60,600]'"),
+            ("relearn_steps", "TEXT NOT NULL DEFAULT '[600]'"),
+        ]
+        for (name, type) in additions where !deckColumns.contains(name) {
+            try db.execute("ALTER TABLE decks ADD COLUMN \(name) \(type);")
+        }
+    }
+
+    /// v5: the note type's Anki stylesheet, so imported cards keep their layout.
+    private static func migrateV5(db: SQLiteDatabase) throws {
+        let columns = try db.query("PRAGMA table_info(note_types)") { $0.string(1) }
+        if !columns.contains("css") {
+            try db.execute("ALTER TABLE note_types ADD COLUMN css TEXT NOT NULL DEFAULT '';")
         }
     }
 
@@ -115,13 +179,6 @@ public enum Schema {
         );
         CREATE INDEX idx_reviews_card ON reviews(card_id, reviewed_at);
         CREATE INDEX idx_reviews_time ON reviews(reviewed_at);
-        """)
-
-        try db.execute("""
-        CREATE TABLE meta (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
         """)
 
         // Built-in note types.

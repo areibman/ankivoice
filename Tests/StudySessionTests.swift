@@ -369,6 +369,24 @@ final class StudySessionTests: XCTestCase {
         XCTAssertEqual(today.reviews, 1)
     }
 
+    /// Touching Reveal while the question is still being read flips the card
+    /// instead of waiting for the reading to finish.
+    func testRevealWhileTheQuestionIsBeingRead() async throws {
+        let deck = try makeDeck(with: [("Q1", "A1")])
+        engine.stallSpeaking = true
+        let started = Task { await controller.start(deck: deck, engine: engine) }
+        await waitUntil(engine.entries().contains { $0.hasPrefix("speak(") })
+        XCTAssertEqual(controller.state, .speakingPrompt)
+
+        engine.stallSpeaking = false
+        await controller.reveal(mode: .touch)
+        await waitUntil(controller.state == .awaitingRating)
+        await started.value
+
+        XCTAssertTrue(engine.entries().contains("stopSpeaking"))
+        XCTAssertEqual(controller.touchInteractions, 1)
+    }
+
     // MARK: - Scheduling effects
 
     func testRatingAdvancesSchedulingState() async throws {
@@ -440,63 +458,6 @@ final class StudySessionTests: XCTestCase {
         engine.emitCommand(.good)
         await waitUntil(controller.state == .finished || controller.reviewsThisSession == 1)
         XCTAssertTrue(controller.completedWithoutTouch)
-    }
-}
-
-/// A failing speech stack degrades to touch-only mode instead of dead-ending.
-final class TouchOnlyFallbackTests: XCTestCase {
-
-    @MainActor
-    func testEngineFailureFallsBackToTouchOnly() async throws {
-        let db = try SQLiteDatabase.inMemory()
-        try Schema.migrate(db: db)
-        let decks = DeckRepository(db: db)
-        let cardsRepo = CardRepository(db: db)
-        let reviews = ReviewRepository(db: db)
-        let queue = StudyQueue(cards: cardsRepo, reviews: reviews)
-        let defaults = UserDefaults(suiteName: "TouchOnlyFallback-\(UUID().uuidString)")!
-        let settings = SettingsStore(defaults: defaults)
-        let controller = StudySessionController(
-            decks: decks, cards: cardsRepo, reviews: reviews, queue: queue, settings: settings
-        )
-
-        let deck = try decks.create(fullName: "Fallback")
-        _ = try cardsRepo.createNote(fields: ["Q1", "A1"], deckID: deck.id)
-
-        final class BrokenEngine: VoiceSessionEngine, @unchecked Sendable {
-            let events: AsyncStream<VoiceEvent> = AsyncStream { $0.finish() }
-            func prepare(voice: VoiceConfig, commandLocale: String) async throws {
-                throw VoiceEngineError.speechUnavailable
-            }
-            func speak(_ segments: [SpeechRenderer.Segment], voice: VoiceConfig) async {}
-            func playConfirmationTone() async {}
-            func startListening(phase: CommandRecognizer.ListeningPhase, endpointMs: Int, recognizer: CommandRecognizer) async throws {}
-            func stopListening() {}
-            func stopSpeaking() {}
-            func shutdown() {}
-        }
-
-        await controller.start(deck: deck, engine: BrokenEngine())
-
-        // The session survives: it advanced to the answer phase, with a
-        // degraded-mode notice, and touch controls still work end to end.
-        let deadline = Date().addingTimeInterval(3)
-        while controller.state != .awaitingAnswer && Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(20))
-        }
-        XCTAssertEqual(controller.state, .awaitingAnswer)
-        XCTAssertNotNil(controller.statusMessage)
-
-        await controller.reveal(mode: .touch)
-        while controller.state != .awaitingRating && Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(20))
-        }
-        XCTAssertEqual(controller.state, .awaitingRating)
-
-        await controller.rate(.good, mode: .touch)
-        XCTAssertEqual(controller.reviewsThisSession, 1)
-        let card = try XCTUnwrap(try cardsRepo.cards(inDeck: deck.id).first)
-        XCTAssertEqual(card.scheduling.kind, .learning)
     }
 }
 

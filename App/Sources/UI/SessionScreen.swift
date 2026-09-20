@@ -13,6 +13,7 @@ struct SessionScreen: View {
     @Environment(AppServices.self) private var services
     @Environment(\.dismiss) private var dismiss
     let deckID: Int64
+    var gather: StudyQueue.Gather = .scheduled
 
     @State private var controller: StudySessionController?
     @State private var fatal: String?
@@ -60,6 +61,7 @@ struct SessionScreen: View {
             decks: services.decks, cards: services.cards, reviews: services.reviews,
             queue: services.queue, settings: services.settings
         )
+        session.gather = gather
         controller = session
         await session.start(deck: deck, engine: SpeechVoiceEngine())
         if session.state == .idle, let message = session.statusMessage {
@@ -79,6 +81,9 @@ struct SessionBody: View {
     @Environment(AppServices.self) private var services
     let controller: StudySessionController
     let onExit: () -> Void
+    /// While the answer is up, a tap shows the question again. The review
+    /// itself doesn't go backwards.
+    @State private var showingQuestion = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -226,8 +231,10 @@ struct SessionBody: View {
                 : "Tap a rating below."
         case .paused:
             return voice ? "Say “resume” or tap the button below." : "Tap Resume to continue."
-        case .speakingPrompt, .speakingAnswer:
-            return voice ? "Say “repeat” to hear it again." : nil
+        case .speakingPrompt:
+            return voice ? "Tap the card to flip it, or say “reveal” once it finishes." : "Tap the card to flip it."
+        case .speakingAnswer:
+            return "Tap the card to see the other side."
         default:
             return nil
         }
@@ -250,15 +257,29 @@ struct SessionBody: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                Text(CardText.plain(shownSide == .answer ? card.note.back : card.note.front))
-                    .font(.title2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
+                RenderedCardView(
+                    face: SpeechRenderer().face(
+                        card,
+                        side: shownSide == .answer ? .answer : .question,
+                        questionLocale: controller.questionLocale,
+                        answerLocale: controller.answerLocale
+                    ),
+                    mediaDirectory: try? AppServices.mediaDirectory()
+                )
+                .id("\(card.id)-\(shownSide == .answer ? "a" : "q")")
+                Text(shownSide == .answer ? "Tap to see the question" : "Tap to flip")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
             }
             .padding(18)
             .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
             .padding(.horizontal)
+            .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .onTapGesture { flipCard() }
+            .onChange(of: controller.currentCard?.id) { _, _ in showingQuestion = false }
             .accessibilityElement(children: .combine)
+            .accessibilityHint("Double-tap to flip")
+            .accessibilityAction(.default) { flipCard() }
         } else if controller.state == .idle {
             Text(controller.statusMessage ?? "Session unavailable")
                 .font(.callout)
@@ -305,6 +326,16 @@ struct SessionBody: View {
                     .font(.subheadline.weight(.medium))
                     .foregroundStyle(.green)
             }
+            if case .scheduled = controller.gather {
+                Button {
+                    Task { await controller.keepStudying() }
+                } label: {
+                    Label("Keep studying", systemImage: "forward.fill")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
             if !controller.sessionLog.isEmpty {
                 Divider().padding(.vertical, 4)
                 VStack(spacing: 8) {
@@ -347,9 +378,24 @@ struct SessionBody: View {
     }
 
     private var shownSide: StudySessionController.Side {
+        if showingQuestion { return .question }
         switch controller.state {
         case .speakingAnswer, .awaitingRating: return .answer
         default: return .question
+        }
+    }
+
+    /// Flip while the card is being read. On the question that reveals the
+    /// answer and stops the reading; on the answer it just shows the front.
+    private func flipCard() {
+        switch controller.state {
+        case .speakingPrompt, .awaitingAnswer, .answerInProgress, .answerComplete:
+            showingQuestion = false
+            Task { await controller.reveal(mode: .touch) }
+        case .speakingAnswer, .awaitingRating:
+            showingQuestion.toggle()
+        default:
+            break
         }
     }
 
@@ -420,7 +466,8 @@ struct SessionBody: View {
     /// Whether the big button is Pause (so the secondary row hides its own).
     private var primaryIsPause: Bool {
         switch controller.state {
-        case .paused, .awaitingAnswer, .answerInProgress, .answerComplete, .awaitingRating: return false
+        case .paused, .speakingPrompt, .awaitingAnswer, .answerInProgress, .answerComplete, .awaitingRating:
+            return false
         default: return true
         }
     }
@@ -433,7 +480,7 @@ struct SessionBody: View {
                 Task { await controller.resume(mode: .touch) }
             }
             .accessibilityIdentifier("session.resume")
-        case .awaitingAnswer, .answerInProgress, .answerComplete:
+        case .speakingPrompt, .awaitingAnswer, .answerInProgress, .answerComplete:
             bigButton("Reveal answer", system: "lightbulb.fill") {
                 Task { await controller.reveal(mode: .touch) }
             }
@@ -525,12 +572,10 @@ extension Rating {
     }
 }
 
-/// Strips Anki HTML down to readable text for on-screen display.
+/// Card text for the session screen; audio-only sides get a placeholder.
 enum CardText {
     static func plain(_ html: String) -> String {
-        let text = AnkiWebClient.DeckInfo.plainText(fromHTML:
-            html.replacingOccurrences(of: #"\[sound:[^\]]+\]"#, with: "", options: .regularExpression)
-        )
+        let text = HTMLText.plain(html)
         return text.isEmpty ? "(audio only)" : text
     }
 }

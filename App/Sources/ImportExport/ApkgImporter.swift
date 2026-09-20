@@ -42,6 +42,7 @@ public struct ApkgImporter: Sendable {
         let id: Int64
         let name: String?
         let type: Int?
+        let css: String?
         let flds: [AnkiField]?
         let tmpls: [AnkiTemplate]?
     }
@@ -87,10 +88,10 @@ public struct ApkgImporter: Sendable {
     /// Anki 2.1 exports ship the real collection as `collection.anki21` next
     /// to a one-note `collection.anki2` stub that just says "upgrade Anki", so
     /// the newer file wins. `collection.anki21b` (Anki ≥ 2.1.50 without
-    /// "support older versions") is zstd-compressed and unreadable here.
+    /// "support older versions") is a zstd frame, decoded before SQLite opens it.
     static func collectionEntryName(in zip: ZipReader) throws -> String {
         if zip.entry(named: "collection.anki21b") != nil {
-            throw ZipReader.ZipError.unsupportedMethod(method: 93, entry: "collection.anki21b")
+            return "collection.anki21b"
         }
         if let name = ["collection.anki21", "collection.anki2"].first(where: { zip.entry(named: $0) != nil }) {
             return name
@@ -116,6 +117,9 @@ public struct ApkgImporter: Sendable {
             .appendingPathComponent("apkg-\(UUID().uuidString).sqlite")
         defer { try? FileManager.default.removeItem(at: tempURL) }
         try zip.extract(dbName, to: tempURL)
+        if dbName == "collection.anki21b" {
+            try Zstd.expandInPlace(tempURL)
+        }
 
         let anki = try SQLiteDatabase.open(url: tempURL, readOnly: true)
 
@@ -140,17 +144,21 @@ public struct ApkgImporter: Sendable {
                          fieldNames: fields.isEmpty ? ["Front", "Back"] : fields,
                          templates: templates.isEmpty
                             ? NoteType.basic.templates : templates,
-                         kind: kind)
+                         kind: kind,
+                         css: model.css ?? "")
             )
             noteTypeIDMap[model.id] = localID
         }
 
         // 2. Decks (hierarchy via :: names).
         var deckIDMap: [Int64: Int64] = [:]
+        var newDeckIDs: Set<Int64> = []
         for deck in col.decks ?? [] where deck.id > 0 && deck.name != "Default" {
             let trimmed = deck.name.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
+            let existed = try decks.deck(named: trimmed) != nil
             let local = try decks.create(fullName: trimmed)
+            if !existed { newDeckIDs.insert(local.id) }
             deckIDMap[deck.id] = local.id
         }
         let defaultDeck = try decks.create(fullName: "Default")
@@ -190,6 +198,7 @@ public struct ApkgImporter: Sendable {
         let batchSize = 200
         let totalNotes = max(notes.count, 1)
         var processed = 0
+        var deckCardCounts: [Int64: Int] = [:]
         for batchStart in stride(from: 0, to: notes.count, by: batchSize) {
             let batch = notes[batchStart..<min(batchStart + batchSize, notes.count)]
             try cardsRepo.db.transaction {
@@ -197,7 +206,7 @@ public struct ApkgImporter: Sendable {
                     try importNote(
                         note, cardsByNote: cardsByNote, revlogByCard: revlogByCard,
                         noteTypeIDMap: noteTypeIDMap, deckIDMap: deckIDMap, defaultDeck: defaultDeck,
-                        crt: crt, scheduler: scheduler, result: &result
+                        crt: crt, scheduler: scheduler, result: &result, deckCardCounts: &deckCardCounts
                     )
                 }
             }
@@ -230,8 +239,10 @@ public struct ApkgImporter: Sendable {
             }
         }
 
+        try assignDetectedLocales(to: newDeckIDs)
+
         progress?(1, "Done")
-        result.deckID = defaultDeck.id
+        result.deckID = deckCardCounts.max(by: { $0.value < $1.value })?.key ?? defaultDeck.id
         return result
     }
 
@@ -247,10 +258,12 @@ public struct ApkgImporter: Sendable {
         defaultDeck: Deck,
         crt: Double,
         scheduler: FSRSScheduler,
-        result: inout Result
+        result: inout Result,
+        deckCardCounts: inout [Int64: Int]
     ) throws {
         let fields = note.flds.split(separator: "\u{1f}", omittingEmptySubsequences: false).map(String.init)
         guard !fields.isEmpty else { return }
+        if DeckTutorial.isAnkiUpgradeNotice(fieldTexts: fields) { return }
         let tags = note.tags.split(separator: " ").map(String.init).filter { $0 != "" }
         let localTypeID = noteTypeIDMap[note.mid] ?? 1
 
@@ -274,6 +287,7 @@ public struct ApkgImporter: Sendable {
             noteTypeID: localTypeID, guid: note.guid
         )
         result.notesImported += 1
+        let readme = DeckTutorial.isReadme(fieldTexts: fields)
 
         // Reconcile card count with ordinals and apply scheduling.
         let localCards = try cardsRepo.cards(forNote: created.id)
@@ -285,13 +299,15 @@ public struct ApkgImporter: Sendable {
                 ankiCard: ankiCard, revlog: entries, crt: crt, scheduler: scheduler
             )
             try cardsRepo.replaceScheduling(scheduling, cardID: local.id)
-            if ankiCard.queue == -1 {
+            if ankiCard.queue == -1 || readme {
                 try cardsRepo.setSuspended(true, cardID: local.id)
             }
             if ankiCard.did != firstCard.did, let cardDeck = deckIDMap[ankiCard.did] {
                 try cardsRepo.moveCard(local.id, toDeck: cardDeck)
             }
             result.cardsImported += 1
+            let home = ankiCard.did != firstCard.did ? (deckIDMap[ankiCard.did] ?? deckID) : deckID
+            deckCardCounts[home, default: 0] += 1
 
             // Review history (best-effort; capped to keep imports fast).
             if !entries.isEmpty {
@@ -311,6 +327,37 @@ public struct ApkgImporter: Sendable {
         }
     }
 
+    /// New decks start in English. A Japanese (or any non-English) download
+    /// would otherwise be read with the English voice — the preview, which
+    /// guesses per card, then sounds like the voices swapped.
+    private func assignDetectedLocales(to deckIDs: Set<Int64>) throws {
+        let renderer = SpeechRenderer()
+        for id in deckIDs {
+            let current = try decks.config(for: id)
+            guard current.voice.questionLocale == "en-US",
+                  current.voice.answerLocale == "en-US",
+                  current.voice.questionVoice == nil,
+                  current.voice.answerVoice == nil else { continue }
+            let sample = try cardsRepo.sampleStudyCards(deckID: id, limit: 40)
+                .filter { !$0.card.suspended }
+            guard !sample.isEmpty else { continue }
+            var questions: [String] = []
+            var answers: [String] = []
+            for card in sample.prefix(16) {
+                let rendered = renderer.render(card, questionLocale: "en-US", answerLocale: "en-US")
+                questions.append(SpeechRenderer.plainText(of: rendered.question))
+                answers.append(SpeechRenderer.plainText(of: rendered.answer))
+            }
+            let question = LanguageGuess.dominant(in: questions, fallback: "en-US")
+            let answer = LanguageGuess.dominant(in: answers, fallback: "en-US")
+            guard question != "en-US" || answer != "en-US" else { continue }
+            var voice = current.voice
+            voice.questionLocale = question
+            voice.answerLocale = answer
+            try decks.updateVoiceConfig(voice, for: id)
+        }
+    }
+
     // MARK: - Scheduling translation
 
     /// Maps one Anki card row into our scheduling state.
@@ -327,7 +374,9 @@ public struct ApkgImporter: Sendable {
             let kind: CardStateKind
             var dueDate: Date
             switch ankiCard.type {
-            case 0: kind = .new; dueDate = Date()
+            // New cards store a queue position in `due`, not a timestamp.
+            // Other Anki apps show them in that order.
+            case 0: kind = .new; dueDate = Date(timeIntervalSince1970: ankiCard.due)
             case 1, 3: kind = ankiCard.type == 3 ? .relearning : .learning; dueDate = Date(timeIntervalSince1970: ankiCard.due)
             default: kind = .review; dueDate = Date(timeIntervalSince1970: crt + ankiCard.due * 86_400)
             }
@@ -358,9 +407,9 @@ public struct ApkgImporter: Sendable {
         switch ankiCard.queue {
         case -1, -2, -3:  // suspended / buried
             fallthrough
-        case 0:  // new
+        case 0:  // new — `due` is the card's position, not a date
             state.kind = .new
-            state.due = Date()
+            state.due = Date(timeIntervalSince1970: ankiCard.due)
         case 1:  // learning
             state.kind = .learning
             state.step = 0
@@ -378,6 +427,7 @@ public struct ApkgImporter: Sendable {
             state.due = Date(timeIntervalSince1970: crt + ankiCard.due * 86_400)
         default:
             state.kind = .new
+            state.due = Date(timeIntervalSince1970: ankiCard.due)
         }
         return (state, revlog.count)
     }
@@ -385,10 +435,9 @@ public struct ApkgImporter: Sendable {
     // MARK: - Collection parsing
 
     private func readCollection(_ db: SQLiteDatabase) throws -> AnkiCol {
-        struct ColRow: Decodable {
-            let crt: Double?
-            let decks: String?
-            let models: String?
+        let tables = Set(try db.query("SELECT name FROM sqlite_master WHERE type = 'table'") { $0.string(0) })
+        if tables.contains("notetypes"), tables.contains("decks"), tables.contains("fields") {
+            return try readRelationalCollection(db)
         }
         let rows = try db.query("SELECT crt, decks, models FROM col LIMIT 1") {
             (crt: $0.doubleOrNil(0), decks: $0.stringOrNil(1), models: $0.stringOrNil(2))
@@ -426,5 +475,43 @@ public struct ApkgImporter: Sendable {
             decks: parseDecks(row.decks),
             models: parseModels(row.models)
         )
+    }
+
+    /// Anki 23+ stores decks and note types in tables. `config` blobs are
+    /// protobuf: notetype kind is field 1, template q/a formats are fields 1 and 2.
+    private func readRelationalCollection(_ db: SQLiteDatabase) throws -> AnkiCol {
+        let crt = try db.query("SELECT crt FROM col LIMIT 1") { $0.doubleOrNil(0) }.first ?? nil
+        let decks = try db.query("SELECT id, name FROM decks") {
+            AnkiDeck(id: $0.int(0), name: $0.string(1))
+        }
+        let noteRows = try db.query("SELECT id, name, config FROM notetypes") {
+            (id: $0.int(0), name: $0.string(1), config: $0.blob(2))
+        }
+        let fieldRows = try db.query("SELECT ntid, ord, name FROM fields ORDER BY ntid, ord") {
+            (ntid: $0.int(0), ord: $0.int32(1), name: $0.string(2))
+        }
+        let templateRows = try db.query("SELECT ntid, ord, name, config FROM templates ORDER BY ntid, ord") {
+            (ntid: $0.int(0), ord: $0.int32(1), name: $0.string(2), config: $0.blob(3))
+        }
+        var models: [String: AnkiModel] = [:]
+        for note in noteRows {
+            let fields = fieldRows.filter { $0.ntid == note.id }.map { AnkiField(name: $0.name) }
+            let templates = templateRows.filter { $0.ntid == note.id }.map { row in
+                let message = try? ProtobufMessage(data: row.config)
+                return AnkiTemplate(
+                    name: row.name,
+                    qfmt: message?.string(1),
+                    afmt: message?.string(2),
+                    ord: row.ord
+                )
+            }
+            let config = try? ProtobufMessage(data: note.config)
+            let kind = config?.int(1) ?? 0
+            models[String(note.id)] = AnkiModel(
+                id: note.id, name: note.name, type: kind, css: config?.string(3),
+                flds: fields, tmpls: templates
+            )
+        }
+        return AnkiCol(crt: crt, decks: decks, models: models)
     }
 }

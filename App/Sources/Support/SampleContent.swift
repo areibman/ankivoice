@@ -39,18 +39,33 @@ public enum SampleContent {
         ("What is the square root of 144?", "12"),
     ]
 
-    /// Creates the sample decks if they do not exist yet.
+    /// Creates the sample decks on first launch. Runs once per install so a
+    /// user who deletes them isn't handed them back on the next visit.
+    @MainActor
+    public static func seedIfNeeded(decks: DeckRepository, cards: CardRepository, settings: SettingsStore) throws {
+        guard !settings.sampleContentSeeded else { return }
+        _ = try ensureTutorialDeck(decks: decks, cards: cards)
+        if try decks.deck(named: starterDeckName) == nil {
+            try seed(starterCards, into: starterDeckName, decks: decks, cards: cards)
+        }
+        settings.sampleContentSeeded = true
+    }
+
+    /// The tutorial deck, created if the user deleted it before re-running onboarding.
+    public static func ensureTutorialDeck(decks: DeckRepository, cards: CardRepository) throws -> Deck {
+        if let existing = try decks.deck(named: tutorialDeckName) { return existing }
+        return try seed(tutorialCards, into: tutorialDeckName, decks: decks, cards: cards)
+    }
+
     @discardableResult
-    public static func seedIfNeeded(decks: DeckRepository, cards: CardRepository) throws -> Bool {
-        guard (try? decks.deck(named: tutorialDeckName)) == nil else { return false }
-        let tutorial = try decks.create(fullName: tutorialDeckName)
-        for card in tutorialCards {
-            _ = try cards.createNote(fields: [card.front, card.back], deckID: tutorial.id)
+    private static func seed(
+        _ content: [(front: String, back: String)], into deckName: String,
+        decks: DeckRepository, cards: CardRepository
+    ) throws -> Deck {
+        let deck = try decks.create(fullName: deckName)
+        for card in content {
+            _ = try cards.createNote(fields: [card.front, card.back], deckID: deck.id)
         }
-        let starter = try decks.create(fullName: starterDeckName)
-        for card in starterCards {
-            _ = try cards.createNote(fields: [card.front, card.back], deckID: starter.id)
-        }
-        return true
+        return deck
     }
 }

@@ -1,17 +1,15 @@
 import Foundation
 
-/// CSV/TSV export and full local backup (PRD §28).
+/// CSV export and full local backup (PRD §28).
 public struct ExportService {
 
     public init() {}
 
-    // MARK: - Delimited text export
+    // MARK: - CSV export
 
-    public func exportCSV(
-        cards: [StudyCard], delimiter: Character = ",", includeProgress: Bool = false
-    ) -> String {
+    public func exportCSV(cards: [StudyCard], includeProgress: Bool = false) -> String {
         func quote(_ field: String) -> String {
-            if field.contains(delimiter) || field.contains("\"") || field.contains("\n") {
+            if field.contains(",") || field.contains("\"") || field.contains("\n") {
                 return "\"" + field.replacingOccurrences(of: "\"", with: "\"\"") + "\""
             }
             return field
@@ -21,10 +19,10 @@ public struct ExportService {
         if includeProgress {
             lines.append(
                 ["Front", "Back", "Tags", "State", "Due", "Stability", "Difficulty", "Reps", "Lapses"]
-                    .map(quote).joined(separator: String(delimiter))
+                    .map(quote).joined(separator: ",")
             )
         } else {
-            lines.append("Front\(delimiter)Back\(delimiter)Tags")
+            lines.append("Front,Back,Tags")
         }
 
         let formatter = ISO8601DateFormatter()
@@ -48,7 +46,7 @@ public struct ExportService {
                     String(s.lapses),
                 ])
             }
-            lines.append(fields.map(quote).joined(separator: String(delimiter)))
+            lines.append(fields.map(quote).joined(separator: ","))
         }
         return lines.joined(separator: "\n") + "\n"
     }

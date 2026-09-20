@@ -8,18 +8,6 @@ public final class DeckRepository: @unchecked Sendable {
 
     // MARK: Mapping
 
-    struct DeckRow {
-        var id: Int64
-        var name: String
-        var fullName: String
-        var parentID: Int64?
-        var createdAt: Date
-        var modifiedAt: Date
-        var study: StudyConfig
-        var voice: VoiceConfig
-        var lastStudiedAt: Date?
-    }
-
     static func rowToDeck(_ r: Row) -> Deck {
         Deck(
             id: r.int(0),
@@ -27,7 +15,8 @@ public final class DeckRepository: @unchecked Sendable {
             fullName: r.string(2),
             parentID: r.isNull(3) ? nil : r.int(3),
             createdAt: r.date(4),
-            modifiedAt: r.date(5)
+            modifiedAt: r.date(5),
+            kind: DeckKind(rawValue: r.int32(17)) ?? .normal
         )
     }
 
@@ -35,8 +24,9 @@ public final class DeckRepository: @unchecked Sendable {
         id, name, full_name, parent_id, created_at, modified_at,
         new_per_day, reviews_per_day, desired_retention, maximum_interval_days,
         question_locale, answer_locale, question_voice, answer_voice,
-        speech_rate, endpoint_delay_ms, semantic_grading_enabled, last_studied_at,
-        use_default_speech_rate
+        speech_rate, last_studied_at, use_default_speech_rate,
+        kind, bury_new, bury_reviews, bury_interday, filter_query, filter_limit,
+        filter_order, reschedule, fsrs_parameters, easy_days, learn_steps, relearn_steps
         """
 
     static func config(from r: Row) -> (study: StudyConfig, voice: VoiceConfig, lastStudied: Date?) {
@@ -44,7 +34,14 @@ public final class DeckRepository: @unchecked Sendable {
             newPerDay: r.int32(6),
             reviewsPerDay: r.int32(7),
             desiredRetention: r.double(8),
-            maximumIntervalDays: r.int32(9)
+            maximumIntervalDays: r.int32(9),
+            buryNewSiblings: r.int(18) != 0,
+            buryReviewSiblings: r.int(19) != 0,
+            buryInterdayLearning: r.int(20) != 0,
+            parameters: r.stringOrNil(25).flatMap { decodeJSON([Double].self, $0) },
+            easyDays: r.stringOrNil(26).flatMap { decodeJSON([Double].self, $0) } ?? [1, 1, 1, 1, 1, 1, 1],
+            learningSteps: r.stringOrNil(27).flatMap { decodeJSON([Double].self, $0) } ?? [60, 600],
+            relearningSteps: r.stringOrNil(28).flatMap { decodeJSON([Double].self, $0) } ?? [600]
         )
         let voice = VoiceConfig(
             questionLocale: r.string(10),
@@ -52,18 +49,16 @@ public final class DeckRepository: @unchecked Sendable {
             questionVoice: r.stringOrNil(12),
             answerVoice: r.stringOrNil(13),
             speechRate: r.double(14),
-            usesDefaultSpeechRate: r.int(18) != 0,
-            endpointDelayMs: r.int32(15),
-            semanticGradingEnabled: r.int(16) != 0
+            usesDefaultSpeechRate: r.int(16) != 0
         )
-        return (study, voice, r.dateOrNil(17))
+        return (study, voice, r.dateOrNil(15))
     }
 
     // MARK: CRUD
 
     /// Creates a deck (and any missing ancestors implied by a `::`-separated full name).
     @discardableResult
-    public func create(fullName: String, defaultConfig: Bool = true) throws -> Deck {
+    public func create(fullName: String) throws -> Deck {
         try db.transaction {
             let parts = fullName.split(separator: Deck.nameSeparator)
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -149,6 +144,14 @@ public final class DeckRepository: @unchecked Sendable {
                 frontier.append(contentsOf: children)
             }
             for did in ids {
+                try db.run(
+                    """
+                    UPDATE cards SET deck_id = original_deck_id, original_deck_id = NULL,
+                        filter_position = NULL
+                    WHERE deck_id = ? AND original_deck_id IS NOT NULL
+                    """,
+                    [.int(did)]
+                )
                 try db.run("DELETE FROM cards WHERE deck_id = ?", [.int(did)])
                 try db.run("DELETE FROM decks WHERE id = ?", [.int(did)])
             }
@@ -167,11 +170,66 @@ public final class DeckRepository: @unchecked Sendable {
         try db.run(
             """
             UPDATE decks SET new_per_day = ?, reviews_per_day = ?, desired_retention = ?,
-                maximum_interval_days = ?, modified_at = ? WHERE id = ?
+                maximum_interval_days = ?, bury_new = ?, bury_reviews = ?, bury_interday = ?,
+                fsrs_parameters = ?, easy_days = ?, learn_steps = ?, relearn_steps = ?,
+                modified_at = ? WHERE id = ?
             """,
             [
                 .int(Int64(config.newPerDay)), .int(Int64(config.reviewsPerDay)),
                 .double(config.desiredRetention), .int(Int64(config.maximumIntervalDays)),
+                .bool(config.buryNewSiblings), .bool(config.buryReviewSiblings),
+                .bool(config.buryInterdayLearning),
+                .optionalText(config.parameters.map { json($0) }),
+                .text(json(config.easyDays)),
+                .text(json(config.learningSteps)),
+                .text(json(config.relearningSteps)),
+                .date(Date()), .int(id),
+            ]
+        )
+    }
+
+    public struct FilteredSpec: Sendable, Equatable {
+        public var query: String
+        public var limit: Int
+        public var order: Int
+        public var reschedule: Bool
+
+        public init(query: String, limit: Int, order: Int, reschedule: Bool) {
+            self.query = query
+            self.limit = limit
+            self.order = order
+            self.reschedule = reschedule
+        }
+    }
+
+    public func filteredSpec(for id: Int64) throws -> FilteredSpec? {
+        try db.query(
+            "SELECT kind, filter_query, filter_limit, filter_order, reschedule FROM decks WHERE id = ?",
+            [.int(id)]
+        ) { row -> FilteredSpec? in
+            guard row.int32(0) == DeckKind.filtered.rawValue else { return nil }
+            return FilteredSpec(
+                query: row.stringOrNil(1) ?? "",
+                limit: row.int32(2),
+                order: row.int32(3),
+                reschedule: row.int(4) != 0
+            )
+        }.first ?? nil
+    }
+
+    public func setKind(_ kind: DeckKind, for id: Int64) throws {
+        try db.run("UPDATE decks SET kind = ?, modified_at = ? WHERE id = ?", [.int(Int64(kind.rawValue)), .date(Date()), .int(id)])
+    }
+
+    public func setFilteredSpec(_ spec: FilteredSpec, for id: Int64) throws {
+        try db.run(
+            """
+            UPDATE decks SET kind = ?, filter_query = ?, filter_limit = ?, filter_order = ?,
+                reschedule = ?, modified_at = ? WHERE id = ?
+            """,
+            [
+                .int(Int64(DeckKind.filtered.rawValue)), .text(spec.query),
+                .int(Int64(spec.limit)), .int(Int64(spec.order)), .bool(spec.reschedule),
                 .date(Date()), .int(id),
             ]
         )
@@ -181,15 +239,13 @@ public final class DeckRepository: @unchecked Sendable {
         try db.run(
             """
             UPDATE decks SET question_locale = ?, answer_locale = ?, question_voice = ?, answer_voice = ?,
-                speech_rate = ?, endpoint_delay_ms = ?, semantic_grading_enabled = ?,
-                use_default_speech_rate = ?, modified_at = ?
+                speech_rate = ?, use_default_speech_rate = ?, modified_at = ?
             WHERE id = ?
             """,
             [
                 .text(config.questionLocale), .text(config.answerLocale),
                 .optionalText(config.questionVoice), .optionalText(config.answerVoice),
-                .double(config.speechRate), .int(Int64(config.endpointDelayMs)),
-                .bool(config.semanticGradingEnabled), .bool(config.usesDefaultSpeechRate),
+                .double(config.speechRate), .bool(config.usesDefaultSpeechRate),
                 .date(Date()), .int(id),
             ]
         )

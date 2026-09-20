@@ -1,50 +1,40 @@
 import SwiftUI
-import os
 
 /// Tells the user exactly what's wrong with their voice setup and how to
-/// fix it. Two things can go wrong: the speech recognition model isn't
-/// installed (hands-free commands fail), or only the robotic built-in voice
-/// is installed (cards sound bad). Both are fixed in the Settings app.
-private let speechLog = Logger(subsystem: "local.ankivoice", category: "speech-diag")
-
+/// fix it. Speech recognition (dictation) and card reading (iOS voices or
+/// Supertonic 3) are separate: missing dictation falls back to touch,
+/// while a robotic reading voice is fixed by downloading an iOS Premium
+/// voice or the on-device Supertonic model.
 struct VoiceSetupView: View {
     @Environment(AppServices.self) private var services
     @State private var inventory = VoiceInventory.shared
     @State private var report: DeviceSpeechReport?
-    @State private var isLoading = false
     @State private var showGuide = false
+    @State private var supertonic = SupertonicTTS.shared
 
     var body: some View {
         Form {
             if let report {
                 recognitionSection(report)
-                voiceSection
-            } else {
-                Section {
-                    HStack(spacing: 12) {
-                        ProgressView()
-                        Text("Checking…").foregroundStyle(.secondary)
-                    }
-                }
             }
+            voiceSection
+            supertonicSetupSection
             Section {
                 Button {
-                    Task { await refresh() }
+                    refresh()
                 } label: {
-                    HStack {
-                        Label("Check again", systemImage: "arrow.clockwise")
-                        Spacer()
-                        if isLoading { ProgressView() }
-                    }
+                    Label("Check again", systemImage: "arrow.clockwise")
                 }
-                .disabled(isLoading)
             } footer: {
                 Text("Voices are re-checked automatically when you return from the Settings app.")
             }
         }
         .navigationTitle("Voice setup")
         .navigationBarTitleDisplayMode(.inline)
-        .task { await refresh() }
+        .onAppear { refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            refresh()
+        }
         .sheet(isPresented: $showGuide) {
             NaturalVoiceGuideView(locale: services.settings.commandLocale)
         }
@@ -61,8 +51,8 @@ struct VoiceSetupView: View {
                 )
             } else if !report.speechAssetsInstalled {
                 statusRow(
-                    ok: false, title: "Speech model not installed",
-                    detail: "Turn on Dictation in Settings → General → Keyboard. iOS then downloads the \(VoicePickerView.regionName(report.commandLocale)) model (~500 MB, Wi‑Fi recommended), which AnkiVoice also uses."
+                    ok: false, title: "Dictation model not installed",
+                    detail: "This is Apple’s on-device speech recognition, not the Supertonic reading voice. Turn on Dictation in Settings → General → Keyboard. iOS then downloads the \(VoicePickerView.regionName(report.commandLocale)) model (Wi‑Fi recommended), which AnkiVoice uses to recognize you entirely on this iPhone."
                 )
                 Button {
                     SystemSettingsLinks.openAppSettings()
@@ -84,7 +74,9 @@ struct VoiceSetupView: View {
         let status = VoiceQualityStatus(locale: locale, inventory: inventory, settings: services.settings)
         return Section {
             if let voice = status.voice {
-                if let better = status.betterInstalled {
+                if voice.kind == .supertonic3 {
+                    statusRow(ok: true, title: "\(voice.name) · Supertonic 3", detail: "Cards are read on this iPhone with an on-device neural voice. The model downloads once (about 400 MB).")
+                } else if let better = status.betterInstalled {
                     statusRow(ok: false, title: "\(voice.name) · built-in (your pick)", detail: "\(better.name) (\(better.qualityTitle)) is installed and sounds far more natural. Choose it — or Automatic — under Voices; nothing to download.")
                 } else {
                     switch voice.quality {
@@ -93,7 +85,7 @@ struct VoiceSetupView: View {
                     case .enhanced:
                         statusRow(ok: true, title: "\(voice.name) · Enhanced", detail: "Sounds good; a free Premium voice sounds even better.")
                     case .compact:
-                        statusRow(ok: false, title: "Robotic voice", detail: "Only \(voice.name), the basic built-in voice, is installed. Natural voices are a free download — Siri's voices don't count, apps can't use them.")
+                        statusRow(ok: false, title: "Robotic voice", detail: "Only \(voice.name), the basic built-in voice, is installed. Natural iOS voices are a free download — Siri's voices don't count, apps can't use them. Or download Supertonic 3 below for on-device neural speech.")
                     }
                 }
             } else {
@@ -105,7 +97,7 @@ struct VoiceSetupView: View {
                 Label("Choose a voice", systemImage: "person.wave.2")
             }
             .accessibilityIdentifier("voicesetup.picker")
-            if !status.isPremium && status.betterInstalled == nil {
+            if !status.isPremium && status.betterInstalled == nil && status.voice?.kind != .supertonic3 {
                 Button {
                     showGuide = true
                 } label: {
@@ -115,6 +107,56 @@ struct VoiceSetupView: View {
             }
         } header: {
             Text("Reading cards · \(VoicePickerView.languageName(SettingsStore.languageKey(for: locale)))")
+        }
+    }
+
+    private var supertonicSetupSection: some View {
+        Section {
+            switch supertonic.phase {
+            case .idle:
+                Button {
+                    Task { try? await supertonic.prepare() }
+                } label: {
+                    Label("Download model (~400 MB)", systemImage: "arrow.down.circle")
+                }
+                .accessibilityIdentifier("voicesetup.supertonic.download")
+            case .downloading:
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("Downloading on-device model…")
+                    }
+                    if let fraction = supertonic.downloadFraction, fraction > 0 {
+                        ProgressView(value: fraction)
+                        Text("\(Int(fraction * 100))%")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                }
+            case .ready:
+                statusRow(ok: true, title: "Model on this iPhone", detail: "Pick a speaker under Voices. Automatic never uses it.")
+            case .failed(let message):
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                    Button {
+                        Task { try? await supertonic.prepare() }
+                    } label: {
+                        Label("Retry download", systemImage: "arrow.clockwise")
+                    }
+                }
+            }
+            NavigationLink {
+                VoicePickerView(initialLocale: services.settings.commandLocale)
+            } label: {
+                Label("Choose a Supertonic speaker", systemImage: "person.wave.2")
+            }
+        } header: {
+            Text("Supertonic 3")
+        } footer: {
+            Text("A neural reading voice that runs on this iPhone. Separate from the dictation model above. Ten speakers; one ~400 MB download from Hugging Face.")
         }
     }
 
@@ -136,15 +178,8 @@ struct VoiceSetupView: View {
         .padding(.vertical, 4)
     }
 
-    private func refresh() async {
-        isLoading = true
-        defer { isLoading = false }
+    private func refresh() {
         inventory.refresh()
-        let live = LiveDeviceSpeechCapabilities()
-        let locale = services.settings.commandLocale
-        report = await live.report(commandLocale: locale)
-        if let r = report {
-            speechLog.info("[SPEECH-DIAG] VoiceSetup: supported=\(r.speechRecognitionSupported) assets=\(r.speechAssetsInstalled) voices=\(r.ttsVoicesForLocale.count)")
-        }
+        report = DeviceSpeechCapabilities.report(commandLocale: services.settings.commandLocale)
     }
 }

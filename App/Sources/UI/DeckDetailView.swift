@@ -1,9 +1,8 @@
 import SwiftUI
-import Speech
 import UIKit
 
-/// Deck detail: one big Study button, today's workload, voice readiness,
-/// sub-decks and card management.
+/// Deck detail: one big Study button, today's workload, sub-decks and card
+/// management.
 struct DeckDetailView: View {
     @Environment(AppServices.self) private var services
     let deckID: Int64
@@ -13,36 +12,15 @@ struct DeckDetailView: View {
     @State private var counts: CardRepository.DeckCounts = .init()
     @State private var remaining: StudyQueue.Remaining = .init()
     @State private var voice = VoiceConfig()
-    @State private var readiness: OfflineReadiness.Result?
     @State private var sessionActive = false
+    @State private var studyDeckID: Int64?
+    @State private var gather: StudyQueue.Gather = .scheduled
+    @State private var showCustomStudy = false
     @State private var showRename = false
     @State private var shareURL: URL?
     @State private var confirmDelete = false
-    @State private var voicePickerTarget: VoicePickerTarget?
-    @State private var showVoiceSetup = false
-
-    /// Which voice the picker edits. Most decks follow the Settings default
-    /// for their language; a deck with its own override edits that instead,
-    /// otherwise the change would have no audible effect here.
-    private enum VoicePickerTarget: Int, Identifiable {
-        case appDefault, deckOverride
-        var id: Int { rawValue }
-    }
-
-    private func openVoicePicker() {
-        voicePickerTarget = voice.questionVoice == nil ? .appDefault : .deckOverride
-    }
-
-    private var deckQuestionVoice: Binding<String?> {
-        Binding(
-            get: { voice.questionVoice },
-            set: { newValue in
-                voice.questionVoice = newValue
-                try? services.decks.updateVoiceConfig(voice, for: deckID)
-            }
-        )
-    }
-    @State private var inventory = VoiceInventory.shared
+    @State private var isExporting = false
+    @State private var exportError: String?
 
     var body: some View {
         List {
@@ -86,14 +64,32 @@ struct DeckDetailView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Button {
+                            showCustomStudy = true
+                        } label: {
+                            Label("Custom study", systemImage: "square.stack.3d.up.badge.a")
+                        }
+                        Button {
                             showRename = true
                         } label: {
                             Label("Rename", systemImage: "pencil")
                         }
                         Button {
-                            export(deck)
+                            exportAnki(deck, includeScheduling: true)
                         } label: {
-                            Label("Export as CSV", systemImage: "square.and.arrow.up")
+                            Label("Export Anki package", systemImage: "square.and.arrow.up")
+                        }
+                        .disabled(isExporting)
+                        .accessibilityIdentifier("deck.export.apkg")
+                        Button {
+                            exportAnki(deck, includeScheduling: false)
+                        } label: {
+                            Label("Export Anki package (cards only)", systemImage: "rectangle.stack")
+                        }
+                        .disabled(isExporting)
+                        Button {
+                            exportCSV(deck)
+                        } label: {
+                            Label("Export as CSV", systemImage: "tablecells")
                         }
                         Divider()
                         Button(role: .destructive) {
@@ -111,7 +107,16 @@ struct DeckDetailView: View {
             DeckDetailView(deckID: child.id)
         }
         .fullScreenCover(isPresented: $sessionActive) {
-            SessionScreen(deckID: deckID)
+            SessionScreen(deckID: studyDeckID ?? deckID, gather: gather)
+        }
+        .sheet(isPresented: $showCustomStudy, onDismiss: { Task { await load() } }) {
+            if let deck {
+                CustomStudyView(deckName: deck.fullName) { filteredID in
+                    studyDeckID = filteredID
+                    gather = .scheduled
+                    sessionActive = true
+                }
+            }
         }
         .onChange(of: sessionActive) {
             if !sessionActive { Task { await load() } }
@@ -133,44 +138,27 @@ struct DeckDetailView: View {
         .sheet(item: $shareURL) { url in
             ShareSheet(items: [url])
         }
-        .sheet(item: $voicePickerTarget) { target in
-            // The full picker for this deck's language: choose an installed
-            // voice, or follow the guide to download a natural one.
-            NavigationStack {
-                Group {
-                    switch target {
-                    case .appDefault:
-                        VoicePickerView(initialLocale: voice.questionLocale)
-                    case .deckOverride:
-                        VoicePickerView(mode: .choose(
-                            locale: voice.questionLocale, title: "Question voice",
-                            selection: deckQuestionVoice
-                        ))
-                    }
-                }
-                .toolbar {
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Done") { voicePickerTarget = nil }
-                    }
-                }
-            }
-        }
-        .sheet(isPresented: $showVoiceSetup) {
-            NavigationStack {
-                VoiceSetupView()
-                    .toolbar {
-                        ToolbarItem(placement: .confirmationAction) {
-                            Button("Done") { showVoiceSetup = false }
-                        }
-                    }
-            }
-        }
         .confirmationDialog("Delete this deck and all its cards?", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {
                 if let deck {
                     try? services.decks.delete(deck.id)
                     NotificationCenter.default.post(name: .ankivoiceLibraryDidChange, object: nil)
                 }
+            }
+        }
+        .alert("Couldn't export", isPresented: Binding(
+            get: { exportError != nil },
+            set: { if !$0 { exportError = nil } }
+        )) {
+            Button("OK", role: .cancel) { exportError = nil }
+        } message: {
+            Text(exportError ?? "")
+        }
+        .overlay {
+            if isExporting {
+                ProgressView("Exporting…")
+                    .padding()
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
         }
         .task { await load() }
@@ -204,19 +192,19 @@ struct DeckDetailView: View {
                 }
 
                 Button {
+                    studyDeckID = deckID
+                    gather = remaining.total > 0 ? .scheduled : .more
                     sessionActive = true
                 } label: {
-                    Label("Start Hands-Free Study", systemImage: "waveform")
+                    Label(remaining.total > 0 ? "Start Hands-Free Study" : "Study more", systemImage: "waveform")
                         .font(.headline)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .disabled(remaining.total == 0)
+                .disabled(counts.total == 0 || counts.total == counts.suspended)
                 .accessibilityIdentifier("deck.study")
-
-                voiceStatusRow
             }
             .padding(.vertical, 6)
         } footer: {
@@ -239,67 +227,6 @@ struct DeckDetailView: View {
         .accessibilityElement(children: .combine)
     }
 
-    /// One line about how this deck will sound. Recognition problems win
-    /// over voice quality because they break hands-free entirely. Tapping
-    /// always leads somewhere the voice can actually be changed.
-    @ViewBuilder
-    private var voiceStatusRow: some View {
-        if let readiness {
-            let quality = VoiceQualityStatus(
-                locale: voice.questionLocale, inventory: inventory,
-                settings: services.settings, deckVoice: voice.questionVoice
-            )
-            if !readiness.isReady {
-                // A Button, not a NavigationLink: the list would add a second
-                // chevron next to the one drawn by `statusLine`.
-                Button {
-                    showVoiceSetup = true
-                } label: {
-                    statusLine(ok: false, "Voice needs setup — tap for details")
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("deck.voiceSetup")
-            } else if !quality.isNatural {
-                Button {
-                    openVoicePicker()
-                } label: {
-                    if let better = quality.betterInstalled {
-                        statusLine(ok: false, "Robotic voice — \(better.name) is installed, tap to switch")
-                    } else {
-                        statusLine(ok: false, "Robotic voice — tap to choose or download a natural one")
-                    }
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("deck.voiceGuide")
-            } else {
-                Button {
-                    openVoicePicker()
-                } label: {
-                    statusLine(ok: true, "Voice ready · \(quality.voice?.name ?? "") · works offline")
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("deck.voicePicker")
-            }
-        }
-    }
-
-    private func statusLine(ok: Bool, _ text: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: ok ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                .foregroundStyle(ok ? .green : .orange)
-            Text(text)
-                .font(.footnote)
-                .foregroundStyle(ok ? .secondary : .primary)
-            Spacer()
-            if !ok {
-                Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-            }
-        }
-        .contentShape(Rectangle())
-    }
-
     private func languageName(_ code: String) -> String {
         let locale = Locale(identifier: code)
         let language = locale.language.languageCode?.identifier ?? code
@@ -315,19 +242,44 @@ struct DeckDetailView: View {
         voice = voiceConfig
         remaining = (try? services.queue.remaining(forDeck: deckID, config: study)) ?? .init()
         childDecks = (try? services.decks.all().filter { $0.parentID == deckID }) ?? []
-        readiness = await OfflineReadiness.check(voiceConfig: voiceConfig, commandLocale: services.settings.commandLocale)
     }
 
-    private func export(_ deck: Deck) {
-        guard let cards = try? services.cards.search(query: "", deckID: deck.id) else { return }
-        let csv = ExportService().exportCSV(cards: cards, includeProgress: true)
-        let safeName = deck.name.replacingOccurrences(of: "/", with: "-")
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(safeName).csv")
+    private func exportCSV(_ deck: Deck) {
         do {
+            let ids = try services.cards.descendantDeckIDs(including: deck.id)
+            let cards = try services.cards.studyCards(inDeckIDs: ids)
+            let csv = ExportService().exportCSV(cards: cards, includeProgress: true)
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("\(ApkgExporter.safeFilename(deck.name)).csv")
             try Data(csv.utf8).write(to: url)
             shareURL = url
         } catch {
-            // Export failure is non-fatal; nothing to share.
+            exportError = error.localizedDescription
+        }
+    }
+
+    private func exportAnki(_ deck: Deck, includeScheduling: Bool) {
+        isExporting = true
+        exportError = nil
+        let decks = services.decks
+        let cards = services.cards
+        let reviews = services.reviews
+        let deckID = deck.id
+        Task {
+            defer { isExporting = false }
+            do {
+                let media = try AppServices.mediaDirectory()
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try ApkgExporter(decks: decks, cards: cards, reviews: reviews).exportDeck(
+                        id: deckID,
+                        options: ApkgExporter.Options(includeScheduling: includeScheduling, includeMedia: true),
+                        mediaDirectory: media
+                    )
+                }.value
+                shareURL = result.url
+            } catch {
+                exportError = error.localizedDescription
+            }
         }
     }
 }

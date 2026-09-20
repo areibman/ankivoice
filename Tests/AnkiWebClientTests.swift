@@ -193,7 +193,7 @@ final class AnkiWebClientTests: XCTestCase {
         let sample = try XCTUnwrap(deck.sampleNotes.first)
         XCTAssertEqual(sample.fields.map(\.name), ["Front", "Back", "Notes"])
         XCTAssertEqual(sample.values, ["する", "do, make[sound:0.mp3]"], "empty trailing field is dropped")
-        XCTAssertEqual(AnkiWebClient.DeckInfo.plainText(fromHTML: sample.values[1]), "do, make")
+        XCTAssertEqual(HTMLText.plain(sample.values[1]), "do, make")
     }
 
     func testItemInfoWithoutDeckPayloadIsAnAddon() throws {
@@ -260,7 +260,7 @@ final class AnkiWebClientTests: XCTestCase {
 
     func testPlainTextStripsMarkupEntitiesAndSoundTags() {
         let html = "<div>Hello&nbsp;<b>there</b></div><p>Second&amp;third</p>[sound:a.mp3]<img src=\"x.png\">"
-        XCTAssertEqual(AnkiWebClient.DeckInfo.plainText(fromHTML: html), "Hello there\nSecond&third")
+        XCTAssertEqual(HTMLText.plain(html), "Hello there\nSecond&third")
     }
 }
 
@@ -282,8 +282,8 @@ final class FlashcardPreviewTests: XCTestCase {
         let cards = FlashcardPreview.cards(from: [note])
         XCTAssertEqual(cards.count, 1)
         XCTAssertEqual(cards[0].front.text, "食べる")
-        XCTAssertEqual(cards[0].back.map(\.text), ["たべる", "to eat", "毎日食べる。"])
-        XCTAssertEqual(cards[0].back.map(\.label), ["Reading", "Meaning", "Sentence"])
+        XCTAssertEqual(cards[0].back.map(\.text), ["to eat", "たべる", "毎日食べる。"])
+        XCTAssertEqual(cards[0].back.map(\.label), ["Meaning", "Reading", "Sentence"])
         XCTAssertEqual(cards[0].frontLanguage, "ja-JP")
     }
 
@@ -321,8 +321,8 @@ final class FlashcardPreviewTests: XCTestCase {
         let cards = FlashcardPreview.cards(from: [note])
         XCTAssertEqual(cards.count, 1)
         XCTAssertEqual(cards[0].front.text, "何やってたのよ授業中に", "furigana and separators stripped")
-        XCTAssertEqual(cards[0].back.map(\.label), ["RemarksBack", "Jlab-Hiragana"])
-        XCTAssertEqual(cards[0].back[1].text, "なにやってたのよじゅぎょうちゅうに")
+        XCTAssertEqual(cards[0].back.map(\.label), ["Jlab-Hiragana", "RemarksBack"])
+        XCTAssertEqual(cards[0].back[0].text, "なにやってたのよじゅぎょうちゅうに")
         XCTAssertEqual(cards[0].frontLanguage, "ja-JP")
     }
 
@@ -353,6 +353,75 @@ final class FlashcardPreviewTests: XCTestCase {
         let cards = FlashcardPreview.cards(from: [note])
         XCTAssertEqual(cards[0].front.text, "Only side")
         XCTAssertEqual(cards[0].back.count, 1)
+    }
+
+    /// Core 2000 and Kaishi name the gloss "Vocabulary-English" / "Word Meaning".
+    /// Those must be the back of the preview, not another prompt, and a part
+    /// of speech like "nf" must not crowd out the translation.
+    func testLanguageDeckFieldsPutTheWordInFrontAndTheGlossOnTheBack() {
+        let core = AnkiWebClient.SampleNote(fields: [
+            Field(name: "Optimized-Voc-Index", value: "1888"),
+            Field(name: "Vocabulary-Kanji", value: "寂しい"),
+            Field(name: "Vocabulary-Furigana", value: "寂[さび]しい"),
+            Field(name: "Vocabulary-Kana", value: "さびしい"),
+            Field(name: "Vocabulary-English", value: "lonely, desolate, sad"),
+            Field(name: "Vocabulary-Audio", value: "[sound:0.mp3]"),
+            Field(name: "Vocabulary-Pos", value: "Adjective"),
+            Field(name: "Expression", value: "これは寂しい曲ですね。"),
+            Field(name: "Reading", value: "これは 寂[さび]しい 曲[きょく]ですね。"),
+        ])
+        let card = try? XCTUnwrap(FlashcardPreview.cards(from: [core]).first)
+        XCTAssertEqual(card?.front.text, "寂しい")
+        XCTAssertEqual(card?.back.first?.text, "lonely, desolate, sad")
+
+        let spanish = AnkiWebClient.SampleNote(fields: [
+            Field(name: "Ranking", value: "4,201"),
+            Field(name: "Spanish", value: "salsa"),
+            Field(name: "Word Type", value: "nf"),
+            Field(name: "English", value: "sauce, salsa"),
+            Field(name: "Spanish Examples", value: "Me gusta la salsa."),
+            Field(name: "Audio", value: "[sound:0.mp3]"),
+        ])
+        let preview = try? XCTUnwrap(FlashcardPreview.cards(from: [spanish]).first)
+        XCTAssertEqual(preview?.front.text, "salsa")
+        XCTAssertEqual(preview?.back.first?.text, "sauce, salsa")
+        XCTAssertFalse(preview?.back.map(\.text).contains("nf") ?? true)
+        XCTAssertFalse(preview?.back.map(\.text).contains("4,201") ?? true)
+    }
+
+    func testPreviewSkipsTheDeckReadmeAndKeepsTheCard() {
+        let readme = AnkiWebClient.SampleNote(fields: [
+            Field(name: "Front", value: String(repeating: "Please read this before you study. How to use this deck: download the audio, then start with the tutorial. ", count: 6)),
+        ])
+        let card = AnkiWebClient.SampleNote(fields: [
+            Field(name: "Expression", value: "猫"),
+            Field(name: "Meaning", value: "cat"),
+        ])
+        let cards = FlashcardPreview.cards(from: [readme, card])
+        XCTAssertEqual(cards.first?.front.text, "猫")
+    }
+
+    func testKanjiOnlyFrontUsesJapaneseWhenTheCardHasKana() throws {
+        let note = AnkiWebClient.SampleNote(fields: [
+            Field(name: "Expression", value: "授業"),
+            Field(name: "Reading", value: "じゅぎょう"),
+            Field(name: "Meaning", value: "class"),
+        ])
+        let card = try XCTUnwrap(FlashcardPreview.cards(from: [note]).first)
+        XCTAssertEqual(card.front.text, "授業")
+        XCTAssertEqual(card.frontLanguage, "ja-JP")
+        let runs = LanguageGuess.previewRuns(in: card.back.map(\.text).joined(separator: " "), cardHasKana: true)
+        XCTAssertTrue(runs.map(\.locale).contains("ja-JP"))
+        XCTAssertTrue(runs.map(\.locale).contains("en-US"))
+    }
+
+    func testPreviewDeckUsesOneJapaneseVoiceEvenWhenGlossesAreEnglish() {
+        let mixed = [
+            "授業", "class",
+            "たべる", "to eat",
+            "水", "water",
+        ]
+        XCTAssertEqual(LanguageGuess.previewDeckLocale(mixed), "ja-JP")
     }
 
     func testLanguageGuessMapsToRegionalTags() {

@@ -78,24 +78,7 @@ public struct AnkiWebClient: Sendable {
 
         /// Description with HTML stripped, for compact display.
         public var descriptionText: String {
-            Self.plainText(fromHTML: descriptionHTML)
-        }
-
-        static func plainText(fromHTML html: String) -> String {
-            var text = html
-            for br in ["<br>", "<br/>", "<br />", "</p>", "</div>", "</li>", "</h1>", "</h2>", "</h3>"] {
-                text = text.replacingOccurrences(of: br, with: "\n", options: .caseInsensitive)
-            }
-            text = text.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
-            text = text.replacingOccurrences(of: "\\[sound:[^\\]]*\\]", with: "", options: .regularExpression)
-            let entities: [String: String] = [
-                "&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&#39;": "'", "&apos;": "'",
-            ]
-            for (entity, replacement) in entities {
-                text = text.replacingOccurrences(of: entity, with: replacement)
-            }
-            text = text.replacingOccurrences(of: "\n{3,}", with: "\n\n", options: .regularExpression)
-            return text.trimmingCharacters(in: .whitespacesAndNewlines)
+            HTMLText.plain(descriptionHTML)
         }
     }
 
@@ -163,7 +146,7 @@ public struct AnkiWebClient: Sendable {
     // MARK: - Account
 
     /// Whether the persistent cookie jar holds an AnkiWeb session cookie.
-    public var hasSessionCookie: Bool {
+    private var hasSessionCookie: Bool {
         let storage = session.configuration.httpCookieStorage ?? .shared
         return !(storage.cookies(for: base) ?? []).isEmpty
     }

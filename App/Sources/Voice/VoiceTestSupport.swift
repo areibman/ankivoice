@@ -17,6 +17,8 @@ public struct VoiceCatalogVoice: Equatable, Hashable, Sendable, Identifiable {
     public let isNovelty: Bool
     /// A Personal Voice the user trained. Selectable, never auto-selected.
     public let isPersonal: Bool
+    /// Which engine actually speaks this voice.
+    public let kind: VoiceKind
 
     public init(
         identifier: String,
@@ -24,7 +26,8 @@ public struct VoiceCatalogVoice: Equatable, Hashable, Sendable, Identifiable {
         language: String,
         quality: VoiceQualityTier,
         isNovelty: Bool = false,
-        isPersonal: Bool = false
+        isPersonal: Bool = false,
+        kind: VoiceKind = .apple
     ) {
         self.identifier = identifier
         self.name = name
@@ -32,24 +35,38 @@ public struct VoiceCatalogVoice: Equatable, Hashable, Sendable, Identifiable {
         self.quality = quality
         self.isNovelty = isNovelty
         self.isPersonal = isPersonal
+        self.kind = kind
     }
 
-    public var id: String { identifier }
+    /// Identifier plus language so SwiftUI can list the same speaker in
+    /// every locale without collapsing duplicate `Identifiable` ids.
+    public var id: String { "\(identifier)|\(language)" }
 
     /// Lowercase language code ("en" for "en-US").
     public var languageKey: String { SettingsStore.languageKey(for: language) }
 
     /// Voices that automatic selection may pick without the user asking.
-    public var isAutoEligible: Bool { !isNovelty && !isPersonal }
+    /// Neural engines need an explicit tap (they download a large model).
+    public var isAutoEligible: Bool { kind == .apple && !isNovelty && !isPersonal }
 
-    /// Human-readable quality tier.
+    /// Human-readable quality / engine label.
     public var qualityTitle: String {
-        switch quality {
-        case .premium: return "Premium"
-        case .enhanced: return "Enhanced"
-        case .compact: return "Default"
+        switch kind {
+        case .supertonic3: return "Supertonic 3"
+        case .apple:
+            switch quality {
+            case .premium: return "Premium"
+            case .enhanced: return "Enhanced"
+            case .compact: return "Default"
+            }
         }
     }
+}
+
+/// Where a catalog voice's audio comes from.
+public enum VoiceKind: Equatable, Hashable, Sendable {
+    case apple
+    case supertonic3
 }
 
 public enum VoiceQualityTier: Int, Equatable, Hashable, Comparable, Sendable {
@@ -89,7 +106,8 @@ public final class SystemVoiceCatalog: VoiceCatalogProtocol {
             language: v.language,
             quality: tier,
             isNovelty: isNovelty(v),
-            isPersonal: isPersonal(v)
+            isPersonal: isPersonal(v),
+            kind: .apple
         )
     }
 
@@ -128,5 +146,15 @@ public final class InMemoryVoiceCatalog: VoiceCatalogProtocol, @unchecked Sendab
 
     public func voices(matching languagePrefix: String) -> [VoiceCatalogVoice] {
         voices.filter { languagePrefix.isEmpty || $0.language.lowercased().hasPrefix(languagePrefix.lowercased()) }
+    }
+}
+
+/// Installed iOS voices plus the on-device Supertonic 3 presets.
+public final class AppVoiceCatalog: VoiceCatalogProtocol {
+    public init() {}
+
+    public func voices(matching languagePrefix: String) -> [VoiceCatalogVoice] {
+        SystemVoiceCatalog().voices(matching: languagePrefix)
+            + SupertonicVoiceCatalog.voices(matching: languagePrefix)
     }
 }

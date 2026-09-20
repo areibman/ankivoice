@@ -15,8 +15,15 @@ struct FlashcardPreview: View {
         let front: Side
         let back: [Side]
 
-        var frontLanguage: String { LanguageGuess.locale(for: front.text) }
-        var backLanguage: String { LanguageGuess.locale(for: back.map(\.text).joined(separator: "\n")) }
+        var usesJapaneseScript: Bool {
+            LanguageGuess.containsKana(([front.text] + back.map(\.text)).joined(separator: "\n"))
+        }
+        var frontLanguage: String {
+            LanguageGuess.dominantLocale(in: front.text, cardHasKana: usesJapaneseScript)
+        }
+        var backLanguage: String {
+            LanguageGuess.dominantLocale(in: back.map(\.text).joined(separator: "\n"), cardHasKana: usesJapaneseScript)
+        }
     }
 
     let cards: [Card]
@@ -70,6 +77,10 @@ struct FlashcardPreview: View {
                     Text(isFlipped ? "BACK" : "FRONT")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
+                    Text(LanguageGuess.shortName(speakingLocale))
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
                     Spacer()
                     Text("\(card.id + 1) of \(cards.count)")
                         .font(.caption.monospacedDigit())
@@ -88,52 +99,76 @@ struct FlashcardPreview: View {
                 }
 
                 ScrollView(showsIndicators: false) {
-                    if isFlipped {
-                        VStack(alignment: .leading, spacing: 10) {
-                            ForEach(Array(card.back.enumerated()), id: \.offset) { _, side in
-                                VStack(alignment: .leading, spacing: 2) {
-                                    if !side.label.isEmpty {
-                                        Text(Self.humanized(side.label))
-                                            .font(.caption2.weight(.semibold))
-                                            .foregroundStyle(.tertiary)
-                                    }
-                                    Text(side.text)
-                                        .font(card.back.count == 1 ? .title3 : .body)
-                                }
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    } else {
-                        Text(card.front.text)
-                            .font(card.front.text.count > 60 ? .body : .title2)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
+                    // The flip gesture stays on the card face. If it covered
+                    // the speaker button too, one tap both flipped the card
+                    // and started the *other* side's voice.
+                    cardBody(card, flipped: isFlipped)
+                        .onTapGesture { flip(card.id) }
                 }
 
                 Text(isFlipped ? "Tap to see the front" : "Tap to reveal the answer")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+                    .onTapGesture { flip(card.id) }
             }
             .padding(16)
-            // The container rotates 180° when flipped; mirror the content
-            // back so it reads normally on the far side.
             .scaleEffect(x: isFlipped ? -1 : 1, y: 1)
         }
         .rotation3DEffect(.degrees(isFlipped ? 180 : 0), axis: (x: 0, y: 1, z: 0))
-        .contentShape(Rectangle())
-        .onTapGesture {
-            withAnimation(.spring(duration: 0.4)) {
-                if isFlipped { flipped.remove(card.id) } else { flipped.insert(card.id) }
-            }
-            tts.stopSpeaking()
-            speakingCard = nil
-        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(isFlipped ? "Back: \(card.back.map(\.text).joined(separator: ". "))" : "Front: \(card.front.text)")
         .accessibilityHint("Double-tap to flip")
     }
 
+    @ViewBuilder
+    private func cardBody(_ card: Card, flipped isFlipped: Bool) -> some View {
+        if isFlipped {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(Array(card.back.enumerated()), id: \.offset) { _, side in
+                    VStack(alignment: .leading, spacing: 2) {
+                        if !side.label.isEmpty {
+                            Text(Self.humanized(side.label))
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        Text(side.text)
+                            .font(card.back.count == 1 ? .title3 : .body)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            Text(card.front.text)
+                .font(card.front.text.count > 60 ? .body : .title2)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func flip(_ id: Int) {
+        withAnimation(.spring(duration: 0.4)) {
+            if flipped.contains(id) { flipped.remove(id) } else { flipped.insert(id) }
+        }
+        tts.stopSpeaking()
+        speakingCard = nil
+    }
+
     private enum Side { case front, back }
+
+    /// One language for every sample card. Detecting each card on its own
+    /// swapped the speaker between Japanese, Chinese, and English as you swiped.
+    private var speakingLocale: String {
+        LanguageGuess.previewDeckLocale(cards.flatMap { [$0.front.text] + $0.back.map(\.text) })
+    }
+
+    /// The voice the user actually picked. If they chose a Supertonic speaker
+    /// for another language, keep that speaker instead of jumping to a
+    /// different Apple voice just because this deck is Japanese.
+    private var previewVoice: String? {
+        if let chosen = services.settings.defaultVoice(forLocale: speakingLocale) { return chosen }
+        return services.settings.defaultVoices.values
+            .sorted()
+            .first { SupertonicVoiceCatalog.isSupertonic($0) }
+    }
 
     private func speak(_ card: Card, side: Side) {
         if speakingCard == card.id {
@@ -141,22 +176,22 @@ struct FlashcardPreview: View {
             speakingCard = nil
             return
         }
-        let text: String
-        let locale: String
+        let texts: [String]
         switch side {
-        case .front:
-            text = card.front.text
-            locale = card.frontLanguage
-        case .back:
-            text = card.back.map(\.text).joined(separator: ". ")
-            locale = card.backLanguage
+        case .front: texts = [card.front.text]
+        case .back: texts = card.back.map(\.text)
         }
+        let text = texts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ". ")
         guard !text.isEmpty else { return }
         speakingCard = card.id
+        let locale = speakingLocale
         let rate = services.settings.speechRate
-        let preferredVoice = services.settings.defaultVoice(forLocale: locale)
+        let voice = previewVoice
         Task {
-            await tts.previewText(text, locale: locale, rate: rate, preferredVoice: preferredVoice)
+            await tts.previewText(text, locale: locale, rate: rate, preferredVoice: voice)
             if speakingCard == card.id { speakingCard = nil }
         }
     }
@@ -171,8 +206,12 @@ struct FlashcardPreview: View {
     /// names are scored so the most prompt-like field becomes the front and
     /// the most answer-like fields become the back, in the deck's own order.
     static func cards(from samples: [AnkiWebClient.SampleNote], limit: Int = 6, maxBackFields: Int = 3) -> [Card] {
+        // The first sample on a shared deck is often the author's readme.
+        // Previewing that makes a Japanese deck sound like a tutorial.
+        let studyNotes = samples.filter { !DeckTutorial.isReadme(fieldTexts: $0.fields.map(\.value)) }
+        let source = studyNotes.isEmpty ? samples : studyNotes
         var out: [Card] = []
-        for sample in samples {
+        for sample in source {
             let fields = sample.fields
                 .map { Card.Side(label: $0.name, text: previewText($0.value)) }
                 .filter { !$0.text.isEmpty }
@@ -196,6 +235,9 @@ struct FlashcardPreview: View {
             var back: [Card.Side] = []
             let ordered = scored
                 .filter { $0.side != front }
+                // Part-of-speech codes and pitch marks ("nf", "イエ") are not
+                // a side of the card. A real note still is.
+                .filter { $0.back > 0 || $0.side.text.count > 24 }
                 .enumerated()
                 .sorted { a, b in
                     if a.element.back != b.element.back { return a.element.back > b.element.back }
@@ -218,8 +260,12 @@ struct FlashcardPreview: View {
 
     /// What a note field is for, judged from its name (and, for
     /// housekeeping, its value). `nil` means "never show this".
+    ///
+    /// The specific token wins. "Vocabulary-English" and "Word Meaning"
+    /// are the gloss, not the word, even though the name also contains
+    /// "vocabulary" or "word".
     enum FieldRole {
-        case prompt, answer, extra, neutral
+        case prompt, meaning, reading, extra, neutral
 
         /// Bookkeeping and generated helper fields: never shown.
         private static let hidden: Set<String> = [
@@ -228,30 +274,47 @@ struct FlashcardPreview: View {
             "source", "sources", "references", "reference", "audio", "sound", "image", "images", "picture",
             "img", "media", "metadata", "lookup", "cloze", "listening", "spaced", "lemma", "html", "css",
         ]
+        /// The word the learner is being tested on.
         private static let promptWords: Set<String> = [
-            "front", "question", "expression", "word", "words", "kanji", "vocab", "vocabulary", "term",
-            "prompt", "target", "sentence", "text", "hanzi", "hangul", "phrase", "example", "simplified",
-            "traditional", "japanese", "spanish", "french", "german", "chinese", "korean", "italian",
-            "portuguese", "russian", "latin", "arabic", "hebrew", "hindi", "thai", "vietnamese", "dutch",
-            "swedish", "norwegian", "finnish", "polish", "turkish", "greek", "verb", "noun", "adjective",
+            "front", "question", "expression", "kanji", "hanzi", "hangul",
+            "prompt", "target", "simplified", "traditional",
         ]
-        private static let answerWords: Set<String> = [
-            "back", "answer", "meaning", "meanings", "translation", "definition", "definitions", "english",
-            "reading", "hiragana", "katakana", "pinyin", "romaji", "furigana", "gloss", "pronunciation",
-            "ipa", "explanation", "synonyms",
+        /// Prefixes that describe a family of fields ("Vocabulary-Kanji")
+        /// but don't say which side that field is.
+        private static let genericPrompt: Set<String> = [
+            "word", "words", "vocab", "vocabulary", "term", "sentence", "example",
+            "examples", "phrase", "japanese", "spanish", "french", "german", "chinese",
+            "korean", "italian", "portuguese", "russian", "latin", "arabic", "hebrew",
+            "hindi", "thai", "vietnamese", "dutch", "swedish", "norwegian", "finnish",
+            "polish", "turkish", "greek", "verb", "noun", "adjective",
+        ]
+        private static let meaningWords: Set<String> = [
+            "back", "answer", "meaning", "meanings", "translation", "definition",
+            "definitions", "english", "gloss", "explanation", "synonyms",
+        ]
+        private static let readingWords: Set<String> = [
+            "reading", "hiragana", "katakana", "pinyin", "romaji", "furigana",
+            "pronunciation", "ipa",
         ]
         private static let extraWords: Set<String> = [
-            "remarks", "remark", "notes", "note", "extra", "hint", "hints", "mnemonic", "comment", "comments",
-            "context", "usage", "grammar", "info", "details", "description", "other",
+            "remarks", "remark", "notes", "note", "extra", "hint", "hints", "mnemonic",
+            "comment", "comments", "context", "usage", "grammar", "info", "details",
+            "description", "other", "pos", "type", "gender", "pitch", "accent",
         ]
 
         init?(_ side: Card.Side) {
             let tokens = Self.tokens(in: side.label)
             if tokens.contains(where: { Self.hidden.contains($0) }) { return nil }
             if Self.looksLikeHousekeeping(side.text) { return nil }
+            // "RemarksBack" contains "back" but it is a note, not the answer.
+            let extraHit = tokens.contains(where: { Self.extraWords.contains($0) })
+            if tokens.contains(where: {
+                Self.meaningWords.contains($0) && !(extraHit && ($0 == "back" || $0 == "answer"))
+            }) { self = .meaning; return }
+            if tokens.contains(where: { Self.readingWords.contains($0) }) { self = .reading; return }
             if tokens.contains(where: { Self.promptWords.contains($0) }) { self = .prompt; return }
-            if tokens.contains(where: { Self.answerWords.contains($0) }) { self = .answer; return }
             if tokens.contains(where: { Self.extraWords.contains($0) }) { self = .extra; return }
+            if tokens.contains(where: { Self.genericPrompt.contains($0) }) { self = .prompt; return }
             self = .neutral
         }
 
@@ -259,14 +322,16 @@ struct FlashcardPreview: View {
             switch self {
             case .prompt: return 3
             case .neutral: return 1
-            case .answer: return 0
+            case .reading: return 0
+            case .meaning: return 0
             case .extra: return -1
             }
         }
 
         var backPriority: Int {
             switch self {
-            case .answer: return 3
+            case .meaning: return 4
+            case .reading: return 3
             case .neutral: return 2
             case .prompt: return 1
             case .extra: return 0
@@ -310,7 +375,7 @@ struct FlashcardPreview: View {
     /// separators some Japanese decks use, and the spaces furigana markup
     /// needs between kanji (`授 業 中` → `授業中`).
     static func previewText(_ html: String) -> String {
-        var text = AnkiWebClient.DeckInfo.plainText(fromHTML: html)
+        var text = HTMLText.plain(html)
         text = text.replacingOccurrences(of: #"\[(?:sound|image|anki):[^\]]*\]"#, with: "", options: [.regularExpression, .caseInsensitive])
         text = text.replacingOccurrences(
             of: #"(?<=[^\s\[\]])\[[\p{Hiragana}\p{Katakana}ー・\s]+\]"#,
@@ -387,5 +452,210 @@ enum LanguageGuess {
         case "uk": return "uk-UA"
         default: return code
         }
+    }
+
+    struct Run: Hashable, Sendable {
+        var text: String
+        var locale: String
+    }
+
+    static func containsKana(_ text: String) -> Bool {
+        text.unicodeScalars.contains(where: isKana)
+    }
+
+    /// Short label for a preview caption ("Japanese", "English").
+    static func shortName(_ locale: String) -> String {
+        switch SettingsStore.languageKey(for: locale) {
+        case "ja": return "Japanese"
+        case "en": return "English"
+        case "zh": return "Chinese"
+        case "ko": return "Korean"
+        case "de": return "German"
+        case "fr": return "French"
+        case "es": return "Spanish"
+        case "it": return "Italian"
+        case "pt": return "Portuguese"
+        case "ru": return "Russian"
+        case "ar": return "Arabic"
+        case "hi": return "Hindi"
+        default:
+            let key = SettingsStore.languageKey(for: locale)
+            return key.isEmpty ? locale : key.uppercased()
+        }
+    }
+
+    /// First script run's locale, with kanji treated as Japanese when the
+    /// card also contains kana. Short Latin stays at `fallback` — NLLanguage
+    /// guesses wildly on "to eat" and is what swapped preview voices.
+    static func dominantLocale(in text: String, cardHasKana: Bool, fallback: String = "en-US") -> String {
+        previewRuns(in: text, cardHasKana: cardHasKana, fallback: fallback).first?.locale ?? fallback
+    }
+
+    /// Splits mixed text so each language is spoken by its own voice.
+    static func previewRuns(in text: String, cardHasKana: Bool, fallback: String = "en-US") -> [Run] {
+        scriptRuns(in: text, fallback: "und", cardHasKana: cardHasKana).map { run in
+            guard run.locale == "und" else { return run }
+            return Run(text: run.text, locale: confidentLocale(for: run.text, fallback: fallback))
+        }
+    }
+
+    /// Script-based runs. Latin (and other unresolved text) keeps `fallback`,
+    /// which is the deck's locale during study so a French deck isn't read
+    /// as English. Pass `"und"` to mark Latin for a later language guess.
+    static func scriptRuns(in text: String, fallback: String, cardHasKana: Bool) -> [Run] {
+        enum Kind: Equatable { case japanese, korean, chinese, arabic, hebrew, cyrillic, thai, latin, other }
+
+        func kind(of scalar: Unicode.Scalar) -> Kind? {
+            if scalar.properties.isWhitespace || isPunctuation(scalar) { return nil }
+            if isKana(scalar) { return .japanese }
+            if isHangul(scalar) { return .korean }
+            if isHan(scalar) {
+                if cardHasKana || fallback.hasPrefix("ja") { return .japanese }
+                return .chinese
+            }
+            if isArabic(scalar) { return .arabic }
+            if isHebrew(scalar) { return .hebrew }
+            if isCyrillic(scalar) { return .cyrillic }
+            if isThai(scalar) { return .thai }
+            if CharacterSet.letters.contains(scalar) { return .latin }
+            return .other
+        }
+
+        func locale(for kind: Kind) -> String {
+            switch kind {
+            case .japanese: return "ja-JP"
+            case .korean: return "ko-KR"
+            case .chinese: return fallback.hasPrefix("zh") ? fallback : "zh-CN"
+            case .arabic: return "ar-SA"
+            case .hebrew: return "he-IL"
+            case .thai: return "th-TH"
+            case .cyrillic:
+                let key = SettingsStore.languageKey(for: fallback)
+                return ["ru", "uk", "bg", "sr"].contains(key) ? fallback : "ru-RU"
+            case .latin, .other:
+                return fallback
+            }
+        }
+
+        var runs: [Run] = []
+        var current: Kind?
+        var buffer = ""
+        // Punctuation before the first letter — cloze "[...]" must survive,
+        // it isn't noise to trim off.
+        var pending = ""
+        func flush() {
+            let trimmed = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let current, !trimmed.isEmpty {
+                runs.append(Run(text: trimmed, locale: locale(for: current)))
+            }
+            buffer = ""
+            current = nil
+        }
+        for scalar in text.unicodeScalars {
+            guard let next = kind(of: scalar) else {
+                if current != nil {
+                    buffer.unicodeScalars.append(scalar)
+                } else {
+                    pending.unicodeScalars.append(scalar)
+                }
+                continue
+            }
+            if next != current {
+                flush()
+                buffer = pending
+                pending = ""
+            } else if !pending.isEmpty {
+                buffer += pending
+                pending = ""
+            }
+            current = next
+            buffer.unicodeScalars.append(scalar)
+        }
+        flush()
+        let leftover = pending.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !leftover.isEmpty, runs.isEmpty {
+            let tag = fallback == "und" ? "und" : fallback
+            runs.append(Run(text: leftover, locale: tag))
+        }
+        return runs
+    }
+
+    /// One locale for a whole preview. A non-English script wins when the
+    /// deck has any of it, so English glosses don't steal the voice.
+    static func previewDeckLocale(_ texts: [String], fallback: String = "en-US") -> String {
+        let joined = texts.joined(separator: "\n")
+        let kana = containsKana(joined)
+        var counts: [String: Int] = [:]
+        for text in texts {
+            for run in scriptRuns(in: text, fallback: fallback, cardHasKana: kana) {
+                let letters = run.text.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
+                counts[run.locale, default: 0] += letters
+            }
+        }
+        let foreign = counts.filter { key, value in
+            value >= 4 && !key.hasPrefix("en")
+        }
+        if let best = foreign.max(by: { $0.value < $1.value }) {
+            return best.key
+        }
+        return dominant(in: texts, fallback: fallback)
+    }
+
+    /// Locale of a deck side, by letter count across sample cards. Stays at
+    /// `fallback` unless there's enough text to be sure.
+    static func dominant(in texts: [String], fallback: String) -> String {
+        let kana = containsKana(texts.joined(separator: "\n"))
+        var counts: [String: Int] = [:]
+        for text in texts {
+            for run in scriptRuns(in: text, fallback: fallback, cardHasKana: kana) {
+                let letters = run.text.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
+                counts[run.locale, default: 0] += letters
+            }
+        }
+        guard let best = counts.max(by: { $0.value < $1.value }), best.value >= 12 else { return fallback }
+        return best.key
+    }
+
+    private static func confidentLocale(for text: String, fallback: String) -> String {
+        let letters = text.unicodeScalars.filter { CharacterSet.letters.contains($0) }
+        guard letters.count >= 12 else { return fallback }
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(text)
+        let hypotheses = recognizer.languageHypotheses(withMaximum: 1)
+        guard let (language, confidence) = hypotheses.max(by: { $0.value < $1.value }),
+              confidence >= 0.45 else { return fallback }
+        return regionalTag(for: language.rawValue, fallback: fallback)
+    }
+
+    private static func isKana(_ scalar: Unicode.Scalar) -> Bool {
+        (scalar.value >= 0x3040 && scalar.value <= 0x30FF) || (scalar.value >= 0xFF66 && scalar.value <= 0xFF9D)
+    }
+
+    private static func isHangul(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value >= 0xAC00 && scalar.value <= 0xD7A3
+    }
+
+    private static func isHan(_ scalar: Unicode.Scalar) -> Bool {
+        (scalar.value >= 0x4E00 && scalar.value <= 0x9FFF) || (scalar.value >= 0x3400 && scalar.value <= 0x4DBF)
+    }
+
+    private static func isArabic(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value >= 0x0600 && scalar.value <= 0x06FF
+    }
+
+    private static func isHebrew(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value >= 0x0590 && scalar.value <= 0x05FF
+    }
+
+    private static func isCyrillic(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value >= 0x0400 && scalar.value <= 0x04FF
+    }
+
+    private static func isThai(_ scalar: Unicode.Scalar) -> Bool {
+        scalar.value >= 0x0E00 && scalar.value <= 0x0E7F
+    }
+
+    private static func isPunctuation(_ scalar: Unicode.Scalar) -> Bool {
+        CharacterSet.punctuationCharacters.contains(scalar) || CharacterSet.symbols.contains(scalar)
     }
 }

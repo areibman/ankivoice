@@ -1,5 +1,8 @@
 import Foundation
 import AVFAudio
+import os
+
+private let audioLog = Logger(subsystem: "local.ankivoice", category: "audio-session")
 
 /// Configures and observes the shared AVAudioSession for hands-free study
 /// (PRD §15, §33, §34).
@@ -10,7 +13,6 @@ import AVFAudio
 /// - Interruptions (calls, Siri, alarms) and route changes are surfaced to
 ///   the session controller, which pauses safely.
 @MainActor
-@Observable
 public final class AudioSessionController {
 
     public static let shared = AudioSessionController()
@@ -22,40 +24,60 @@ public final class AudioSessionController {
     public var onRouteChanged: (@Sendable (_ old: String, _ new: String) -> Void)?
     public var onMediaServicesLost: (@Sendable () -> Void)?
 
-    public private(set) var isConfigured = false
-    public private(set) var lastError: String?
-
     private var observers: [NSObjectProtocol] = []
 
     private init() {}
 
+    /// Category and options used for every activation. `playAndRecord` plus
+    /// the `audio` background mode is what keeps the microphone and TTS alive
+    /// while the screen is locked.
+    private static let options: AVAudioSession.CategoryOptions =
+        [.defaultToSpeaker, .allowBluetoothHFP, .allowBluetoothA2DP]
+
     /// Activates the shared session for combined playback and recording.
     public func activate() throws {
         let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(
-                .playAndRecord,
-                mode: .spokenAudio,
-                options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
-            )
-            try session.setActive(true, options: [])
-            isConfigured = true
-            lastError = nil
-            startObserving()
-        } catch {
-            lastError = error.localizedDescription
-            throw error
+        try session.setCategory(.playAndRecord, mode: .spokenAudio, options: Self.options)
+        try session.setActive(true, options: [])
+        startObserving()
+    }
+
+    /// Re-asserts the category and activates, reporting failure instead of
+    /// throwing.
+    ///
+    /// Activation is routinely refused for a moment when it happens outside
+    /// the foreground — the tail of a call or Siri turn, or the instant the
+    /// screen locks — with `!int` (cannot interrupt others) or `!rec` (cannot
+    /// start recording). Those clear on their own once the other client lets
+    /// go of the route, so retry briefly before treating it as a real failure.
+    @discardableResult
+    public func activateForRecording(attempts: Int = 4) async -> Bool {
+        for attempt in 0..<max(attempts, 1) {
+            if attempt > 0 {
+                try? await Task.sleep(for: .milliseconds(120 * attempt))
+            }
+            let session = AVAudioSession.sharedInstance()
+            do {
+                try session.setCategory(.playAndRecord, mode: .spokenAudio, options: Self.options)
+                try session.setActive(true, options: [])
+                startObserving()
+                return true
+            } catch {
+                audioLog.error(
+                    "[AUDIO] activation attempt \(attempt + 1) failed: \(error.localizedDescription, privacy: .public)"
+                )
+            }
         }
+        return false
     }
 
     public func deactivate() {
         stopObserving()
         try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-        isConfigured = false
     }
 
     /// Current human-readable output route, e.g. "AirPods Pro Headphones".
-    public nonisolated static func currentRouteDescription() -> String {
+    private nonisolated static func currentRouteDescription() -> String {
         let route = AVAudioSession.sharedInstance().currentRoute
         return route.outputs.first?.portName ?? "Unknown"
     }
@@ -137,12 +159,11 @@ public final class AudioSessionController {
             onMediaServicesLost?()
         case .mediaServicesReset:
             // The session died and was reset; re-activate and notify.
-            try? AVAudioSession.sharedInstance().setCategory(
-                .playAndRecord, mode: .spokenAudio,
-                options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
-            )
-            try? AVAudioSession.sharedInstance().setActive(true)
-            onMediaServicesLost?()
+            let notify = onMediaServicesLost
+            Task { [weak self] in
+                await self?.activateForRecording()
+                notify?()
+            }
         }
     }
 

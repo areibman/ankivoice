@@ -168,7 +168,8 @@ public struct AnkiConnectImporter: Sendable {
                     id: model.id, name: model.name,
                     fieldNames: fields.isEmpty ? ["Front", "Back"] : fields,
                     templates: templates.isEmpty ? NoteType.basic.templates : templates,
-                    kind: kind
+                    kind: kind,
+                    css: model.css ?? ""
                 )
             )
             noteTypeIDByModelName[model.name] = localID

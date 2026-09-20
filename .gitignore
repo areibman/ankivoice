@@ -16,5 +16,16 @@ xcuserdata/
 # Agent / tooling
 .omp/
 
+# Release artifacts (archives, IPAs); ExportOptions.plist is kept
+.asc/artifacts/
+
 # macOS
 .DS_Store
+
+# Secrets and local credentials
+.env
+.env.*
+*.p8
+*.pem
+*.mobileprovision
+AuthKey_*.p8

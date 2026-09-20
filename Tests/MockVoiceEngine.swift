@@ -17,6 +17,12 @@ final class MockVoiceEngine: VoiceSessionEngine {
     var stallSpeaking = false
     private var speakWaiters: [CheckedContinuation<Void, Never>] = []
 
+    /// When set, `prepare` throws it — the controller must fall back to touch-only.
+    var prepareError: Error?
+    /// When set, every listening window immediately reports this failure
+    /// instead of listening (what the real engine does on RecogRejected).
+    var listeningFailure: String?
+
     private(set) var lastEndpointMs: Int?
     private(set) var lastPhase: CommandRecognizer.ListeningPhase?
 
@@ -39,6 +45,7 @@ final class MockVoiceEngine: VoiceSessionEngine {
 
     func prepare(voice: VoiceConfig, commandLocale: String) async throws {
         record("prepare(\(commandLocale))")
+        if let prepareError { throw prepareError }
     }
 
     func speak(_ segments: [SpeechRenderer.Segment], voice: VoiceConfig) async {
@@ -75,10 +82,14 @@ final class MockVoiceEngine: VoiceSessionEngine {
             lastEndpointMs = endpointMs
             lastPhase = phase
         }
+        if let listeningFailure { emit(.failure(listeningFailure)) }
     }
 
     func stopListening() { record("stopListening") }
-    func stopSpeaking() { record("stopSpeaking") }
+    func stopSpeaking() {
+        record("stopSpeaking")
+        finishSpeaking()
+    }
     func shutdown() { record("shutdown") }
 
     // MARK: Event injection

@@ -17,7 +17,7 @@ final class VoiceInventory {
     private(set) var voices: [VoiceCatalogVoice] = []
     private var observers: [NSObjectProtocol] = []
 
-    init(catalog: VoiceCatalogProtocol = SystemVoiceCatalog(), observesSystem: Bool = true) {
+    init(catalog: VoiceCatalogProtocol = AppVoiceCatalog(), observesSystem: Bool = true) {
         self.catalog = catalog
         refresh()
         guard observesSystem else { return }
@@ -47,8 +47,7 @@ final class VoiceInventory {
     /// one is installed (`override` first — a deck's own pick — then the
     /// user's per-language default), otherwise Automatic's pick.
     func effectiveVoice(for locale: String, settings: SettingsStore, override: String? = nil) -> VoiceCatalogVoice? {
-        chosenVoice(for: locale, settings: settings, override: override)
-            ?? automaticVoice(for: locale, preferredQuality: settings.voiceQuality)
+        chosenVoice(for: locale, settings: settings, override: override) ?? automaticVoice(for: locale)
     }
 
     /// The explicitly chosen voice for `locale`, if it's still installed and
@@ -64,26 +63,15 @@ final class VoiceInventory {
     /// What Automatic picks for `locale`, ignoring any explicit choice:
     /// Premium, then Enhanced, then built-in, preferring the exact region.
     /// Nil when the language has no voice at all.
-    func automaticVoice(for locale: String, preferredQuality: SettingsStore.VoiceQuality = .auto) -> VoiceCatalogVoice? {
+    func automaticVoice(for locale: String) -> VoiceCatalogVoice? {
         let localized = voices(forLanguage: SettingsStore.languageKey(for: locale))
         let id = TextToSpeech.VoiceSelector.best(
             localized: localized,
             allVoices: voices,
-            requestedLocale: locale,
-            preferredQuality: preferredQuality
+            requestedLocale: locale
         )
         guard let id, let voice = localized.first(where: { $0.identifier == id }) else { return nil }
         return voice
-    }
-
-    /// Best quality tier installed for a language, ignoring novelty voices.
-    func bestTier(forLanguage key: String) -> VoiceQualityTier? {
-        voices(forLanguage: key).filter(\.isAutoEligible).map(\.quality).max()
-    }
-
-    /// Whether the language can only be spoken by the robotic built-in voice.
-    func hasOnlyCompactVoices(forLanguage key: String) -> Bool {
-        bestTier(forLanguage: key) == .compact
     }
 }
 
@@ -104,7 +92,7 @@ struct VoiceQualityStatus: Equatable {
     @MainActor
     init(locale: String, inventory: VoiceInventory, settings: SettingsStore, deckVoice: String? = nil) {
         let chosen = inventory.chosenVoice(for: locale, settings: settings, override: deckVoice)
-        let automatic = inventory.automaticVoice(for: locale, preferredQuality: settings.voiceQuality)
+        let automatic = inventory.automaticVoice(for: locale)
         self.init(voice: chosen ?? automatic, isExplicit: chosen != nil, best: automatic)
     }
 
@@ -119,29 +107,11 @@ struct VoiceQualityStatus: Equatable {
         }
     }
 
-    var tier: VoiceQualityTier? { voice?.quality }
-
-    var isMissing: Bool { voice == nil }
-
     /// Enhanced or Premium — anything better than the robotic built-in voice.
     var isNatural: Bool {
-        guard let tier else { return false }
-        return tier > .compact
+        guard let voice else { return false }
+        return voice.quality > .compact
     }
 
-    var isPremium: Bool { tier == .premium }
-
-    /// "Ava · Premium", "Samantha · built-in", "No voice installed".
-    var summary: String {
-        guard let voice else { return "No voice installed" }
-        return "\(voice.name) · \(Self.tierLabel(voice.quality))"
-    }
-
-    static func tierLabel(_ tier: VoiceQualityTier) -> String {
-        switch tier {
-        case .premium: return "Premium"
-        case .enhanced: return "Enhanced"
-        case .compact: return "built-in"
-        }
-    }
+    var isPremium: Bool { voice?.quality == .premium }
 }

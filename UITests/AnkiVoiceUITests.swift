@@ -3,6 +3,7 @@ import XCTest
 /// UI smoke tests driving the real app through onboarding into the deck list
 /// and deck detail. These verify the actual rendered interface via the
 /// accessibility tree (the simulator framebuffer is not capturable headless).
+@MainActor
 final class AnkiVoiceUITests: XCTestCase {
 
     override func setUp() {
@@ -19,18 +20,11 @@ final class AnkiVoiceUITests: XCTestCase {
         let firstTitle = app.staticTexts["Study without touching your phone"]
         XCTAssertTrue(firstTitle.waitForExistence(timeout: 10))
 
-        // Advance through the informational pages (4 advances reach the
-        // final tutorial page).
+        // Two advances through the informational pages reach the tutorial page.
         let continueButton = app.buttons["Continue"]
         XCTAssertTrue(continueButton.waitForExistence(timeout: 5))
         continueButton.tap()
         XCTAssertTrue(app.staticTexts["Four ratings"].waitForExistence(timeout: 5))
-
-        continueButton.tap()
-        XCTAssertTrue(app.staticTexts["Microphone access"].waitForExistence(timeout: 5))
-
-        continueButton.tap()
-        XCTAssertTrue(app.staticTexts["Voice check"].waitForExistence(timeout: 5))
 
         continueButton.tap()
         XCTAssertTrue(app.staticTexts["Try a three-card tutorial"].waitForExistence(timeout: 5))

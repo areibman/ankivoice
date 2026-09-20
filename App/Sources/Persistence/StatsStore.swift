@@ -19,10 +19,6 @@ public final class StatsStore: @unchecked Sendable {
         public var easy = 0
         public var handsFreeReviews = 0
         public var handsFreeSeconds = 0
-
-        public var ratingBreakdown: [Rating: Int] {
-            [.again: again, .hard: hard, .good: good, .easy: easy]
-        }
     }
 
     public func today(deckID: Int64? = nil, now: Date = Date()) throws -> TodayStats {
@@ -78,17 +74,13 @@ public final class StatsStore: @unchecked Sendable {
         public var newCards = 0
         public var handsFreeReviews = 0
         public var handsFreeSeconds = 0
-
-        public var retention: Double {
-            reviews > 0 ? Double(correct) / Double(reviews) : 0
-        }
     }
 
     /// Daily aggregates for the last `days` days.
     public func history(days: Int = 365, deckID: Int64? = nil, now: Date = Date()) throws -> [DayStats] {
         let start = ReviewRepository.startOfStudyDay(now).timeIntervalSince1970 - Double(days) * 86_400
 
-        var joins = "JOIN cards c ON c.id = r.card_id"
+        let joins = "JOIN cards c ON c.id = r.card_id"
         var binds: [SQLiteValue] = [.double(start)]
         var whereClause = "r.reviewed_at >= ?"
         if let deckID {
@@ -175,49 +167,11 @@ public final class StatsStore: @unchecked Sendable {
         return stats
     }
 
-    // MARK: Forecast
-
-    public struct ForecastDay: Sendable, Equatable, Identifiable {
-        public var id: Date { day }
-        public var day: Date
-        public var count: Int
-    }
-
-    /// Due counts for the next `days` days (review-state cards).
-    public func forecast(days: Int = 30, deckID: Int64? = nil, now: Date = Date()) throws -> [ForecastDay] {
-        let start = now.timeIntervalSince1970
-        let end = start + Double(days) * 86_400
-        var binds: [SQLiteValue] = [.double(start), .double(end)]
-        var whereClause = "state = 2 AND suspended = 0 AND due BETWEEN ? AND ?"
-        if let deckID {
-            let ids = try CardRepository(db: db).descendantDeckIDs(including: deckID)
-            whereClause += " AND deck_id IN (\(ids.map { _ in "?" }.joined(separator: ",")))"
-            binds.append(contentsOf: ids.map { .int($0) })
-        }
-        let rows = try db.query(
-            "SELECT due FROM cards WHERE \(whereClause)",
-            binds
-        ) { $0.double(0) }
-
-        let calendar = Calendar.current
-        var byDay: [Date: Int] = [:]
-        for due in rows {
-            let key = calendar.startOfDay(for: Date(timeIntervalSince1970: due))
-            byDay[key, default: 0] += 1
-        }
-        return byDay
-            .map { ForecastDay(day: $0.key, count: $0.value) }
-            .sorted { $0.day < $1.day }
-    }
-
     // MARK: Hands-free totals
 
     public struct HandsFreeStats: Sendable, Equatable {
         public var reviews = 0
         public var seconds = 0
-        public var sessions = 0
-        /// Reviews in sessions that were completed entirely without touch, if tracked.
-        public var touchlessReviews = 0
     }
 
     public func handsFree(now: Date = Date()) throws -> HandsFreeStats {

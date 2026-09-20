@@ -1,9 +1,16 @@
 import SwiftUI
 
-/// Global settings: voices, listening behaviour, study preferences. Backup
-/// and diagnostics live one level down under Advanced.
+/// Global settings: voices, listening behaviour, study preferences, backup
+/// and diagnostics.
 struct SettingsView: View {
     @Environment(AppServices.self) private var services
+    @State private var inventory = VoiceInventory.shared
+    @State private var backupURL: URL?
+    @State private var backupError: String?
+    @State private var isExporting = false
+    @State private var reportCopied = false
+    @State private var optimizing = false
+    @State private var optimizeMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -35,7 +42,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Voice")
                 } footer: {
-                    Text("Pick the voice that reads cards in each language, or leave it on Automatic for the most natural one installed. Commands like “good” and “repeat” are recognized in the command language.")
+                    Text("Pick the voice that reads cards in each language, or leave it on Automatic for the most natural iOS voice installed. Supertonic 3 is an on-device alternative you opt into. Commands like “good” and “repeat” are recognized in the command language.")
                 }
 
                 Section {
@@ -76,21 +83,117 @@ struct SettingsView: View {
                     } label: {
                         Label("Voice setup check", systemImage: "waveform.badge.magnifyingglass")
                     }
-                    NavigationLink {
-                        AdvancedSettingsView()
+                    Button {
+                        exportAnkiCollection()
                     } label: {
-                        Label("Advanced", systemImage: "wrench.and.screwdriver")
+                        Label("Export collection for Anki", systemImage: "square.and.arrow.up")
                     }
+                    .disabled(isExporting)
+                    .accessibilityIdentifier("settings.export.colpkg")
+                    Button {
+                        createBackup()
+                    } label: {
+                        Label("Create full backup", systemImage: "externaldrive.badge.timemachine")
+                    }
+                    .disabled(isExporting)
+                    if let backupError {
+                        Text(backupError).font(.caption).foregroundStyle(.red)
+                    }
+                    Button {
+                        optimizeCollection()
+                    } label: {
+                        Label(optimizing ? "Optimizing FSRS…" : "Optimize FSRS for all decks", systemImage: "function")
+                    }
+                    .disabled(optimizing)
+                    if let optimizeMessage {
+                        Text(optimizeMessage).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Button {
+                        UIPasteboard.general.string = DiagnosticReport.generate(commandLocale: services.settings.commandLocale)
+                        reportCopied = true
+                    } label: {
+                        Label(reportCopied ? "Diagnostic report copied" : "Copy diagnostic report",
+                              systemImage: reportCopied ? "checkmark.circle" : "doc.on.doc")
+                    }
+                } header: {
+                    Text("Data & troubleshooting")
                 } footer: {
-                    Text("AnkiVoice \(Self.versionString) · FSRS-6 scheduling, on device. Speech is recognized on your iPhone; spoken answers are never stored or sent anywhere.")
+                    Text("Anki packages (.apkg / .colpkg) include cards, media and review history so you can open them in Anki. The full backup is AnkiVoice-only. The diagnostic report lists speech, voice and crash information — no card content.\n\nAnkiVoice \(Self.versionString) · FSRS-6 scheduling, on device. Speech is recognized on your iPhone; spoken answers are never stored or sent anywhere.")
                 }
             }
             .navigationTitle("Settings")
             .onAppear { inventory.refresh() }
+            .sheet(item: $backupURL) { url in
+                ShareSheet(items: [url])
+            }
+            .overlay {
+                if isExporting {
+                    ProgressView("Exporting…")
+                        .padding()
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+            }
         }
     }
 
-    @State private var inventory = VoiceInventory.shared
+    private func optimizeCollection() {
+        optimizing = true
+        optimizeMessage = nil
+        let reviews = services.reviews
+        let settings = services.settings
+        Task {
+            defer { optimizing = false }
+            do {
+                let logs = try reviews.allChronological()
+                let report = try await Task.detached(priority: .userInitiated) {
+                    try FSRSOptimizer().optimize(logs: logs)
+                }.value
+                settings.fsrsParameters = report.parameters
+                optimizeMessage = String(
+                    format: "Fit %d reviews. Loss %.3f → %.3f. Decks without their own weights use this.",
+                    report.reviewCount, report.lossBefore, report.lossAfter
+                )
+            } catch let failure as FSRSOptimizer.Failure {
+                if case .notEnoughReviews(let have, let need) = failure {
+                    optimizeMessage = "Need \(need) reviews to optimize. This collection has \(have)."
+                }
+            } catch {
+                optimizeMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func exportAnkiCollection() {
+        isExporting = true
+        backupError = nil
+        let decks = services.decks
+        let cards = services.cards
+        let reviews = services.reviews
+        Task {
+            defer { isExporting = false }
+            do {
+                let media = try AppServices.mediaDirectory()
+                let result = try await Task.detached(priority: .userInitiated) {
+                    try ApkgExporter(decks: decks, cards: cards, reviews: reviews).exportCollection(
+                        mediaDirectory: media
+                    )
+                }.value
+                backupURL = result.url
+            } catch {
+                backupError = error.localizedDescription
+            }
+        }
+    }
+
+    private func createBackup() {
+        do {
+            let media = try AppServices.mediaDirectory()
+            backupURL = try ExportService().fullBackup(database: services.database, mediaDirectory: media)
+            backupError = nil
+        } catch {
+            backupError = error.localizedDescription
+        }
+    }
 
     private var voiceStatus: VoiceQualityStatus {
         VoiceQualityStatus(locale: services.settings.commandLocale, inventory: inventory, settings: services.settings)
@@ -99,6 +202,9 @@ struct SettingsView: View {
     private var voiceSummary: String {
         let status = voiceStatus
         guard let voice = status.voice else { return "No voice installed" }
+        if voice.kind == .supertonic3 {
+            return "\(voice.name) · Supertonic 3"
+        }
         if let better = status.betterInstalled {
             return "\(voice.name) · built-in — \(better.name) is installed"
         }
@@ -148,65 +254,5 @@ struct SettingsView: View {
             get: { services.settings[keyPath: keyPath] },
             set: { services.settings[keyPath: keyPath] = $0 }
         )
-    }
-}
-
-/// Rarely needed: backups, diagnostics, about.
-struct AdvancedSettingsView: View {
-    @Environment(AppServices.self) private var services
-    @State private var backupURL: URL?
-    @State private var backupError: String?
-
-    var body: some View {
-        Form {
-            Section {
-                Button {
-                    createBackup()
-                } label: {
-                    Label("Create full backup", systemImage: "externaldrive.badge.timemachine")
-                }
-                if let backupError {
-                    Text(backupError).font(.caption).foregroundStyle(.red)
-                }
-            } header: {
-                Text("Data")
-            } footer: {
-                Text("Bundles the database and all media into one file you can share or save. Everything stays on this device.")
-            }
-
-            Section {
-                NavigationLink {
-                    DiagnosticDumpView()
-                } label: {
-                    Label("Diagnostic report", systemImage: "doc.text.magnifyingglass")
-                }
-            } header: {
-                Text("Troubleshooting")
-            } footer: {
-                Text("Raw speech, voice and crash information to paste into a bug report.")
-            }
-
-            Section {
-                LabeledContent("Version", value: SettingsView.versionString)
-                LabeledContent("Scheduler", value: "FSRS-6 (on-device)")
-            } header: {
-                Text("About")
-            }
-        }
-        .navigationTitle("Advanced")
-        .navigationBarTitleDisplayMode(.inline)
-        .sheet(item: $backupURL) { url in
-            ShareSheet(items: [url])
-        }
-    }
-
-    private func createBackup() {
-        do {
-            let media = try AppServices.mediaDirectory()
-            backupURL = try ExportService().fullBackup(database: services.database, mediaDirectory: media)
-            backupError = nil
-        } catch {
-            backupError = error.localizedDescription
-        }
     }
 }

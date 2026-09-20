@@ -21,7 +21,6 @@ final class SpeechRendererTests: XCTestCase {
         let rendered = renderer.render(makeCard(front: "<b>What is TCP?</b>", back: "<i>Networking</i>"), questionLocale: "en-US", answerLocale: "en-US")
         XCTAssertEqual(rendered.question, [.speech(text: "What is TCP?", locale: "en-US")])
         XCTAssertEqual(rendered.answer, [.speech(text: "Networking", locale: "en-US")])
-        XCTAssertEqual(rendered.compatibility, .excellent)
     }
 
     func testBrBecomesPause() {
@@ -45,29 +44,41 @@ final class SpeechRendererTests: XCTestCase {
 
     func testSoundReferencesExtractedAsMedia() {
         let card = makeCard(front: "猫 [sound:neko.mp3]", back: "Cat")
-        let (text, media, _) = SpeechRenderer.extract(html: "猫 [sound:neko.mp3]", clozeAnswer: false)
+        let (text, media) = SpeechRenderer.extract(html: "猫 [sound:neko.mp3]", clozeAnswer: false)
         XCTAssertEqual(media, ["neko.mp3"])
         XCTAssertTrue(text.hasPrefix("猫"))
         XCTAssertFalse(text.contains("sound"))
 
-        let rendered = renderer.render(card, questionLocale: "ja-JP", answerLocale: "en-US", preferRecordedAudio: true)
+        let rendered = renderer.render(card, questionLocale: "ja-JP", answerLocale: "en-US")
         XCTAssertEqual(rendered.question.first, .media(filename: "neko.mp3"))
+        XCTAssertTrue(rendered.question.contains(.speech(text: "猫", locale: "ja-JP")))
     }
 
-    func testImageMarksVisualRequired() {
+    /// An audio-only side must still play its recording rather than render as silence.
+    func testAudioOnlySideRendersMediaOnly() {
+        let rendered = renderer.render(
+            makeCard(front: "[sound:word.mp3]", back: "Answer"),
+            questionLocale: "en-US", answerLocale: "en-US"
+        )
+        XCTAssertEqual(rendered.question, [.media(filename: "word.mp3")])
+    }
+
+    func testImageOnlySideHasNothingToSpeak() {
         let rendered = renderer.render(
             makeCard(front: "<img src=\"anatomy.png\">", back: "The heart"),
             questionLocale: "en-US", answerLocale: "en-US"
         )
-        XCTAssertEqual(rendered.compatibility, .visualRequired)
+        XCTAssertTrue(rendered.question.isEmpty)
+        XCTAssertEqual(rendered.answer, [.speech(text: "The heart", locale: "en-US")])
     }
 
-    func testScriptMarksUnsupported() {
+    func testScriptAndStyleBodiesAreNotSpoken() {
         let rendered = renderer.render(
-            makeCard(front: "<script>alert(1)</script>", back: "x"),
+            makeCard(front: "<style>.x{color:red}</style>Question<script>alert(1)</script>", back: "x"),
             questionLocale: "en-US", answerLocale: "en-US"
         )
-        XCTAssertEqual(rendered.compatibility, .unsupported)
+        XCTAssertEqual(rendered.question, [.speech(text: "Question", locale: "en-US")])
+        XCTAssertEqual(HTMLText.plain("<style>.x{color:red}</style>Question<script>alert(1)</script>"), "Question")
     }
 
     // MARK: Cloze
@@ -83,7 +94,6 @@ final class SpeechRendererTests: XCTestCase {
         XCTAssertEqual(rendered.question.first, .speech(text: "The powerhouse of the cell is the [...].", locale: "en-US"))
         // Answer side reveals the content.
         XCTAssertEqual(rendered.answer.first, .speech(text: "The powerhouse of the cell is the mitochondrion.", locale: "en-US"))
-        XCTAssertEqual(rendered.compatibility, .usable)
     }
 
     func testClozeNonActiveOrdinalRevealedInQuestion() {
@@ -133,10 +143,129 @@ final class SpeechRendererTests: XCTestCase {
         XCTAssertTrue(engineText(rendered.answer).contains("cat"))
     }
 
-    func testHiddenFieldHint() {
-        let card = makeCard(front: "{{hint:Front}}", back: "{{Back}}")
-        _ = card
-        // hint:Front renders the value inline as "Hint: value" for speech.
+    /// Core 2000-style templates bury the word under an index, part of speech,
+    /// notes, and a static "about this deck" caption. Voice reads the word
+    /// and the meaning only.
+    func testCoreDeckSpeaksWordAndMeaningNotMetadata() {
+        let type = NoteType(
+            id: 11, name: "Japanese",
+            fieldNames: ["Optimized-Voc-Index", "Vocabulary-Kanji", "Vocabulary-Kana", "Vocabulary-English", "Vocabulary-Pos", "Notes"],
+            templates: [NoteTemplate(
+                name: "Recognition",
+                questionFormat: "<div class=\"index\">Core {{Optimized-Voc-Index}}</div>{{Vocabulary-Kanji}}",
+                answerFormat: "{{Vocabulary-Kana}}<hr>{{Vocabulary-English}}<div>{{Vocabulary-Pos}}</div><div class=\"notes\">{{Notes}}</div><div>This deck is based on the iKnow core list.</div>",
+                ordinal: 0
+            )],
+            kind: .standard
+        )
+        let note = Note(
+            id: 1, noteTypeID: 11,
+            fields: ["14", "食べる", "たべる", "to eat", "noun", "Frequency rank from the shared deck. Please read the tutorial."],
+            tags: [], guid: "g"
+        )
+        let deck = Deck(id: 1, name: "D", fullName: "Japanese::Core 2000", parentID: nil)
+        let card = StudyCard(card: Card(id: 1, noteID: 1, deckID: 1, templateOrdinal: 0), note: note, noteType: type, deck: deck)
+        let rendered = renderer.render(card, questionLocale: "ja-JP", answerLocale: "en-US")
+        let question = engineText(rendered.question)
+        let answer = engineText(rendered.answer)
+        XCTAssertEqual(question, "食べる")
+        XCTAssertEqual(answer, "to eat")
+        XCTAssertFalse(question.contains("14") || question.lowercased().contains("core"))
+        XCTAssertFalse(answer.lowercased().contains("noun"))
+        XCTAssertFalse(answer.lowercased().contains("iknow"))
+        XCTAssertFalse(answer.lowercased().contains("tutorial"))
+    }
+
+    func testJapaneseTemplateSpeaksTheWordNotTheNotes() {
+        let card = makeJapaneseCard()
+        let rendered = renderer.render(card, questionLocale: "ja-JP", answerLocale: "en-US")
+        let question = engineText(rendered.question)
+        let answer = engineText(rendered.answer)
+        XCTAssertTrue(question.contains("たべる"), "furigana should be spoken as the reading, got \(question)")
+        XCTAssertFalse(question.lowercased().contains("download"), "question must not be the deck tutorial")
+        XCTAssertTrue(answer.lowercased().contains("to eat"), "got \(answer)")
+        XCTAssertFalse(answer.lowercased().contains("tutorial"))
+        XCTAssertFalse(answer.lowercased().contains("download"))
+
+        let face = renderer.face(card, side: .question, questionLocale: "ja-JP", answerLocale: "en-US")
+        XCTAssertTrue(face.html.contains("<ruby>"), "the card should show the kanji with its reading")
+        XCTAssertTrue(face.readAloudDiffers)
+        XCTAssertTrue(face.spokenText.contains("たべる"))
+    }
+
+    func testConditionalHidesEmptyNotesAndShowsTheWord() {
+        let type = NoteType(
+            id: 8, name: "J",
+            fieldNames: ["Expression", "Notes"],
+            templates: [NoteTemplate(
+                name: "Card 1",
+                questionFormat: "{{#Notes}}See the notes. {{Notes}}{{/Notes}}{{Expression}}",
+                answerFormat: "{{Expression}}",
+                ordinal: 0
+            )],
+            kind: .standard
+        )
+        let note = Note(id: 1, noteTypeID: 8, fields: ["猫", ""], tags: [], guid: "g")
+        let deck = Deck(id: 1, name: "D", fullName: "D", parentID: nil)
+        let card = StudyCard(card: Card(id: 1, noteID: 1, deckID: 1, templateOrdinal: 0), note: note, noteType: type, deck: deck)
+        let question = engineText(renderer.render(card, questionLocale: "ja-JP", answerLocale: "en-US").question)
+        XCTAssertEqual(question, "猫")
+        XCTAssertFalse(question.contains("notes"))
+    }
+
+    func testLatexIsSpokenAndMarkedAsDifferentFromTheCard() {
+        let rendered = renderer.render(
+            makeCard(front: "[$]E=mc^2[/$]", back: "mass-energy"),
+            questionLocale: "en-US", answerLocale: "en-US"
+        )
+        let spoken = engineText(rendered.question)
+        XCTAssertTrue(spoken.contains("equals"), spoken)
+        XCTAssertTrue(spoken.contains("squared"), spoken)
+        XCTAssertFalse(spoken.contains("[$]"))
+        let face = renderer.face(
+            makeCard(front: "[$]E=mc^2[/$]", back: "mass-energy"),
+            side: .question, questionLocale: "en-US", answerLocale: "en-US"
+        )
+        XCTAssertTrue(face.html.contains("class=\"math\""))
+        XCTAssertTrue(face.readAloudDiffers)
+        XCTAssertFalse(face.html.contains("[$]"))
+    }
+
+    func testMixedLanguageAnswerUsesEachVoice() {
+        let runs = LanguageGuess.scriptRuns(in: "たべる to eat", fallback: "en-US", cardHasKana: true)
+        XCTAssertEqual(runs.map(\.text), ["たべる", "to eat"])
+        XCTAssertEqual(runs.map(\.locale), ["ja-JP", "en-US"])
+        let kanji = LanguageGuess.scriptRuns(in: "授業", fallback: "en-US", cardHasKana: true)
+        XCTAssertEqual(kanji.first?.locale, "ja-JP", "kanji on a kana card must not be handed to a Chinese voice")
+    }
+
+    private func makeJapaneseCard() -> StudyCard {
+        let type = NoteType(
+            id: 7, name: "Japanese",
+            fieldNames: ["Expression", "Meaning", "Reading", "Notes"],
+            templates: [NoteTemplate(
+                name: "Recognition",
+                questionFormat: "{{furigana:Expression}}",
+                answerFormat: "{{kana:Reading}}<hr>{{Meaning}}<div class=\"notes\">{{Notes}}</div>",
+                ordinal: 0
+            )],
+            kind: .standard
+        )
+        let note = Note(
+            id: 1, noteTypeID: 7,
+            fields: [
+                "食[た]べる",
+                "to eat",
+                "たべる",
+                "Please read this before studying. Download the audio for this deck. How to use this deck: finish the tutorial first.",
+            ],
+            tags: [], guid: "g"
+        )
+        let deck = Deck(id: 1, name: "D", fullName: "D", parentID: nil)
+        return StudyCard(
+            card: Card(id: 1, noteID: 1, deckID: 1, templateOrdinal: 0),
+            note: note, noteType: type, deck: deck
+        )
     }
 
     private func engineText(_ segments: [SpeechRenderer.Segment]) -> String {
@@ -145,31 +274,71 @@ final class SpeechRendererTests: XCTestCase {
             return nil
         }.joined(separator: " ")
     }
+
+    /// Hiragana decks put {{type:Back}} on the front and [sound:] in the answer.
+    /// The answer must not appear on the question, and the sound tag must not
+    /// be printed. The deck's CSS travels with the face so the study view can
+    /// center a 60pt character the way the template asks.
+    func testTypingBoxAndSoundTagsDoNotBecomeCardText() {
+        let type = NoteType(
+            id: 8, name: "Basic Card",
+            fieldNames: ["Front", "Back"],
+            templates: [NoteTemplate(
+                name: "Japanese Character",
+                questionFormat: "{{Front}}<br>{{type:Back}}",
+                answerFormat: "{{FrontSide}}<hr id=answer>{{Back}}",
+                ordinal: 0
+            )],
+            kind: .standard,
+            css: ".card { font-size: 60px; text-align: center; color: black; background-color: white; }"
+        )
+        let note = Note(id: 1, noteTypeID: 8, fields: ["け", "ke[sound:0.mp3]"], tags: [], guid: "g")
+        let deck = Deck(id: 1, name: "D", fullName: "D", parentID: nil)
+        let card = StudyCard(
+            card: Card(id: 1, noteID: 1, deckID: 1, templateOrdinal: 0),
+            note: note, noteType: type, deck: deck
+        )
+        let question = renderer.face(card, side: .question, questionLocale: "ja-JP", answerLocale: "ja-JP")
+        XCTAssertTrue(question.html.contains("け"))
+        XCTAssertFalse(question.html.contains("ke"), "typing the answer must not print it on the front")
+        XCTAssertFalse(question.html.contains("[sound:"))
+        XCTAssertTrue(question.css.contains("font-size: 60px"))
+        XCTAssertEqual(question.cardClass, "card card1")
+
+        let answer = renderer.face(card, side: .answer, questionLocale: "ja-JP", answerLocale: "ja-JP")
+        XCTAssertTrue(answer.html.contains("け"))
+        XCTAssertTrue(answer.html.contains("ke"))
+        XCTAssertFalse(answer.html.contains("[sound:"))
+    }
 }
 
 final class CommandRecognizerTests: XCTestCase {
     private let recognizer = CommandRecognizer()
 
+    private func rating(_ transcript: String) -> CommandRecognizer.Command? {
+        recognizer.recognize(transcript: transcript, phase: .awaitingRating)?.command
+    }
+
     func testCanonicalRatings() {
-        for (word, rating) in [("again", Rating.again), ("hard", Rating.hard), ("good", Rating.good), ("easy", Rating.easy)] {
-            XCTAssertEqual(recognizer.recognizeRating(transcript: word), rating)
+        for (word, command) in [("again", CommandRecognizer.Command.again), ("hard", .hard), ("good", .good), ("easy", .easy)] {
+            XCTAssertEqual(rating(word), command)
         }
     }
 
     func testAliases() {
-        XCTAssertEqual(recognizer.recognizeRating(transcript: "wrong"), .again)
-        XCTAssertEqual(recognizer.recognizeRating(transcript: "forgot"), .again)
-        XCTAssertEqual(recognizer.recognizeRating(transcript: "difficult"), .hard)
-        XCTAssertEqual(recognizer.recognizeRating(transcript: "Good."), .good, "punctuation stripped")
+        XCTAssertEqual(rating("wrong"), .again)
+        XCTAssertEqual(rating("forgot"), .again)
+        XCTAssertEqual(rating("difficult"), .hard)
+        XCTAssertEqual(rating("Good."), .good, "punctuation stripped")
     }
 
     func testRatingWithFillers() {
-        XCTAssertEqual(recognizer.recognizeRating(transcript: "um good"), .good)
-        XCTAssertEqual(recognizer.recognizeRating(transcript: "okay easy please"), .easy)
+        XCTAssertEqual(rating("um good"), .good)
+        XCTAssertEqual(rating("okay easy please"), .easy)
     }
 
     func testLongUtteranceIsNotARating() {
-        XCTAssertNil(recognizer.recognizeRating(transcript: "I think it was the mitochondria powerhouse of the cell"))
+        XCTAssertNil(rating("I think it was the mitochondria powerhouse of the cell"))
     }
 
     func testCommandsInRatingPhase() {

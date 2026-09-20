@@ -9,13 +9,13 @@ public final class CardRepository: @unchecked Sendable {
     // MARK: - Note types
 
     public func noteType(id: Int64) throws -> NoteType? {
-        try db.query("SELECT id, name, field_names, templates, kind FROM note_types WHERE id = ?", [.int(id)]) {
+        try db.query("SELECT id, name, field_names, templates, kind, css FROM note_types WHERE id = ?", [.int(id)]) {
             Self.rowToNoteType($0)
         }.first
     }
 
     public func noteType(named name: String) throws -> NoteType? {
-        try db.query("SELECT id, name, field_names, templates, kind FROM note_types WHERE name = ?", [.text(name)]) {
+        try db.query("SELECT id, name, field_names, templates, kind, css FROM note_types WHERE name = ?", [.text(name)]) {
             Self.rowToNoteType($0)
         }.first
     }
@@ -26,7 +26,8 @@ public final class CardRepository: @unchecked Sendable {
             name: r.string(1),
             fieldNames: decodeJSON([String].self, r.string(2)) ?? [],
             templates: decodeJSON([NoteTemplate].self, r.string(3)) ?? [],
-            kind: NoteTypeKind(rawValue: r.int32(4)) ?? .standard
+            kind: NoteTypeKind(rawValue: r.int32(4)) ?? .standard,
+            css: r.string(5)
         )
     }
 
@@ -34,16 +35,16 @@ public final class CardRepository: @unchecked Sendable {
     public func upsertNoteType(_ type: NoteType) throws -> Int64 {
         if let existing = try noteType(id: type.id) ?? noteType(named: type.name) {
             try db.run(
-                "UPDATE note_types SET name = ?, field_names = ?, templates = ?, kind = ? WHERE id = ?",
+                "UPDATE note_types SET name = ?, field_names = ?, templates = ?, kind = ?, css = ? WHERE id = ?",
                 [.text(type.name), .json(type.fieldNames), .json(type.templates),
-                 .int(Int64(type.kind.rawValue)), .int(existing.id)]
+                 .int(Int64(type.kind.rawValue)), .text(type.css), .int(existing.id)]
             )
             return existing.id
         }
         return try db.run(
-            "INSERT INTO note_types (id, name, field_names, templates, kind) VALUES (?,?,?,?,?)",
+            "INSERT INTO note_types (id, name, field_names, templates, kind, css) VALUES (?,?,?,?,?,?)",
             [.int(type.id), .text(type.name), .json(type.fieldNames), .json(type.templates),
-             .int(Int64(type.kind.rawValue))]
+             .int(Int64(type.kind.rawValue)), .text(type.css)]
         )
     }
 
@@ -139,7 +140,8 @@ public final class CardRepository: @unchecked Sendable {
     static let cardSelect = """
         SELECT c.id, c.note_id, c.deck_id, c.template_ordinal, c.state, c.step, c.due,
                c.stability, c.difficulty, c.last_review, c.lapses, c.reps, c.suspended,
-               c.created_at, c.modified_at
+               c.created_at, c.modified_at, c.buried, c.buried_until, c.original_deck_id,
+               c.filter_position
         FROM cards c
         """
 
@@ -147,9 +149,10 @@ public final class CardRepository: @unchecked Sendable {
     static let studyCardSQL = """
         SELECT c.id, c.note_id, c.deck_id, c.template_ordinal, c.state, c.step, c.due,
                c.stability, c.difficulty, c.last_review, c.lapses, c.reps, c.suspended,
-               c.created_at, c.modified_at,
+               c.created_at, c.modified_at, c.buried, c.buried_until, c.original_deck_id,
+               c.filter_position,
                n.note_type_id, n.fields, n.tags, n.guid, n.created_at, n.modified_at,
-               t.name, t.field_names, t.templates, t.kind,
+               t.name, t.field_names, t.templates, t.kind, t.css,
                d.name, d.full_name, d.parent_id, d.created_at, d.modified_at
         FROM cards c
         JOIN notes n ON n.id = c.note_id
@@ -174,6 +177,10 @@ public final class CardRepository: @unchecked Sendable {
                 reps: r.int32(11)
             ),
             suspended: r.int(12) != 0,
+            bury: BuryKind(rawValue: r.int32(15)) ?? .none,
+            buriedUntil: r.dateOrNil(16),
+            originalDeckID: r.isNull(17) ? nil : r.int(17),
+            filterPosition: r.isNull(18) ? nil : r.int32(18),
             createdAt: r.date(13),
             modifiedAt: r.date(14)
         )
@@ -184,27 +191,28 @@ public final class CardRepository: @unchecked Sendable {
             card: rowToCard(r),
             note: Note(
                 id: r.int(1),
-                noteTypeID: r.int(15),
-                fields: decodeJSON([String].self, r.string(16)) ?? [],
-                tags: r.string(17).split(separator: " ").map(String.init),
-                guid: r.string(18),
-                createdAt: r.date(19),
-                modifiedAt: r.date(20)
+                noteTypeID: r.int(19),
+                fields: decodeJSON([String].self, r.string(20)) ?? [],
+                tags: r.string(21).split(separator: " ").map(String.init),
+                guid: r.string(22),
+                createdAt: r.date(23),
+                modifiedAt: r.date(24)
             ),
             noteType: NoteType(
-                id: r.int(15),
-                name: r.string(21),
-                fieldNames: decodeJSON([String].self, r.string(22)) ?? [],
-                templates: decodeJSON([NoteTemplate].self, r.string(23)) ?? [],
-                kind: NoteTypeKind(rawValue: r.int32(24)) ?? .standard
+                id: r.int(19),
+                name: r.string(25),
+                fieldNames: decodeJSON([String].self, r.string(26)) ?? [],
+                templates: decodeJSON([NoteTemplate].self, r.string(27)) ?? [],
+                kind: NoteTypeKind(rawValue: r.int32(28)) ?? .standard,
+                css: r.string(29)
             ),
             deck: Deck(
                 id: r.int(2),
-                name: r.string(25),
-                fullName: r.string(26),
-                parentID: r.isNull(27) ? nil : r.int(27),
-                createdAt: r.date(28),
-                modifiedAt: r.date(29)
+                name: r.string(30),
+                fullName: r.string(31),
+                parentID: r.isNull(32) ? nil : r.int(32),
+                createdAt: r.date(33),
+                modifiedAt: r.date(34)
             )
         )
     }
@@ -245,6 +253,48 @@ public final class CardRepository: @unchecked Sendable {
         return result
     }
 
+    /// Every note type, used when packing an Anki collection.
+    public func allNoteTypes() throws -> [NoteType] {
+        try db.query("SELECT id, name, field_names, templates, kind, css FROM note_types ORDER BY id") {
+            Self.rowToNoteType($0)
+        }
+    }
+
+    /// All schedulable cards in the given decks, unbounded (unlike `search`).
+    public func studyCards(inDeckIDs ids: [Int64]) throws -> [StudyCard] {
+        guard !ids.isEmpty else { return [] }
+        let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+        return try db.query(
+            """
+            \(Self.studyCardSQL)
+            WHERE c.deck_id IN (\(placeholders))
+            ORDER BY n.id, c.template_ordinal
+            """,
+            ids.map { .int($0) }
+        ) { Self.rowToStudyCard($0) }
+    }
+
+    /// A handful of cards, for detecting a newly imported deck's languages
+    /// without loading a 20,000-card collection into memory.
+    public func sampleStudyCards(deckID: Int64, limit: Int) throws -> [StudyCard] {
+        let clamped = max(1, min(limit, 50))
+        return try db.query(
+            """
+            \(Self.studyCardSQL)
+            WHERE c.deck_id = ?
+            ORDER BY n.id, c.template_ordinal
+            LIMIT \(clamped)
+            """,
+            [.int(deckID)]
+        ) { Self.rowToStudyCard($0) }
+    }
+
+    public func allStudyCards() throws -> [StudyCard] {
+        try db.query(
+            "\(Self.studyCardSQL) ORDER BY n.id, c.template_ordinal"
+        ) { Self.rowToStudyCard($0) }
+    }
+
     public func search(query: String, deckID: Int64? = nil, limit: Int = 500) throws -> [StudyCard] {
         let pattern = "%\(query.replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_"))%"
         var sql = """
@@ -267,33 +317,107 @@ public final class CardRepository: @unchecked Sendable {
         }.first
     }
 
-    public func updateScheduling(_ card: Card) throws {
+    public func setBuried(_ kind: BuryKind, until: Date?, cardID: Int64) throws {
+        try db.run(
+            "UPDATE cards SET buried = ?, buried_until = ?, modified_at = ? WHERE id = ?",
+            [.int(Int64(kind.rawValue)), .optionalDate(until), .date(Date()), .int(cardID)]
+        )
+    }
+
+    /// Clears sibling buries whose study day has started.
+    public func expireSiblingBuries(now: Date = Date()) throws {
+        try db.run(
+            "UPDATE cards SET buried = 0, buried_until = NULL WHERE buried = 1 AND buried_until IS NOT NULL AND buried_until <= ?",
+            [.double(now.timeIntervalSince1970)]
+        )
+    }
+
+    /// After a review, bury the note's other cards the way Anki does.
+    public func burySiblings(of card: Card, config: StudyConfig, now: Date = Date()) throws {
+        let nextDay = ReviewRepository.startOfStudyDay(now)
+        let tomorrow = Calendar.current.date(byAdding: .day, value: 1, to: nextDay) ?? now.addingTimeInterval(86_400)
+        let siblings = try cards(forNote: card.noteID).filter { $0.id != card.id && !$0.suspended && $0.bury == .none }
+        for sibling in siblings {
+            let bury: Bool
+            switch sibling.scheduling.kind {
+            case .new:
+                bury = config.buryNewSiblings
+            case .review:
+                bury = config.buryReviewSiblings
+            case .learning, .relearning:
+                bury = config.buryInterdayLearning && sibling.scheduling.due >= tomorrow
+            }
+            if bury {
+                try setBuried(.sibling, until: tomorrow, cardID: sibling.id)
+            }
+        }
+    }
+
+    /// Puts a filtered-deck card back in its home deck.
+    public func returnFromFiltered(_ cardID: Int64) throws {
         try db.run(
             """
-            UPDATE cards SET state = ?, step = ?, due = ?, stability = ?, difficulty = ?,
-                last_review = ?, lapses = ?, reps = ?, suspended = ?, modified_at = ?
-            WHERE id = ?
+            UPDATE cards SET deck_id = original_deck_id, original_deck_id = NULL,
+                filter_position = NULL, modified_at = ?
+            WHERE id = ? AND original_deck_id IS NOT NULL
             """,
-            [
-                .int(Int64(card.scheduling.kind.rawValue)),
-                .optionalInt(card.scheduling.step),
-                .date(card.scheduling.due),
-                .optionalDouble(card.scheduling.stability),
-                .optionalDouble(card.scheduling.difficulty),
-                .optionalDate(card.scheduling.lastReview),
-                .int(Int64(card.scheduling.lapses)),
-                .int(Int64(card.scheduling.reps)),
-                .bool(card.suspended),
-                .date(card.modifiedAt),
-                .int(card.id),
-            ]
+            [.date(Date()), .int(cardID)]
         )
+    }
+
+    /// Review-card counts keyed by whole study-days from `now`, for load balancing.
+    public func reviewCountsByDay(days: Int, now: Date = Date()) throws -> [Int] {
+        let start = ReviewRepository.startOfStudyDay(now)
+        var counts = Array(repeating: 0, count: days)
+        let rows = try db.query(
+            """
+            SELECT due FROM cards
+            WHERE state = 2 AND suspended = 0 AND buried = 0
+            """
+        ) { $0.double(0) }
+        let calendar = Calendar.current
+        for due in rows {
+            let date = Date(timeIntervalSince1970: due)
+            let delta = calendar.dateComponents([.day], from: start, to: ReviewRepository.startOfStudyDay(date)).day ?? 0
+            if delta >= 0, delta < days {
+                counts[delta] += 1
+            }
+        }
+        return counts
+    }
+
+    /// Days that already hold a card from this note. Used so the load balancer
+    /// does not pile siblings on the same day.
+    public func siblingDueDayOffsets(noteID: Int64, excluding cardID: Int64, now: Date = Date()) throws -> [Int] {
+        let start = ReviewRepository.startOfStudyDay(now)
+        let rows = try db.query(
+            "SELECT due FROM cards WHERE note_id = ? AND id != ? AND suspended = 0 AND state = 2",
+            [.int(noteID), .int(cardID)]
+        ) { $0.double(0) }
+        let calendar = Calendar.current
+        return rows.compactMap { due in
+            let date = Date(timeIntervalSince1970: due)
+            return calendar.dateComponents([.day], from: start, to: ReviewRepository.startOfStudyDay(date)).day
+        }
     }
 
     public func setSuspended(_ suspended: Bool, cardID: Int64) throws {
         try db.run(
             "UPDATE cards SET suspended = ?, modified_at = ? WHERE id = ?",
             [.bool(suspended), .date(Date()), .int(cardID)]
+        )
+    }
+
+    /// Moves a card into a filtered deck, remembering its home deck.
+    public func placeInFiltered(_ cardID: Int64, deckID: Int64, position: Int) throws {
+        try db.run(
+            """
+            UPDATE cards SET
+                original_deck_id = COALESCE(original_deck_id, deck_id),
+                deck_id = ?, filter_position = ?, modified_at = ?
+            WHERE id = ?
+            """,
+            [.int(deckID), .int(Int64(position)), .date(Date()), .int(cardID)]
         )
     }
 

@@ -48,6 +48,26 @@ public final class ReviewRepository: @unchecked Sendable {
         ) { Self.rowToReview($0) }
     }
 
+    /// Review history for cards in the given decks, oldest first — used by Anki export.
+    public func history(inDeckIDs ids: [Int64]) throws -> [ReviewLog] {
+        guard !ids.isEmpty else { return [] }
+        let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+        return try db.query(
+            """
+            SELECT r.id, r.card_id, r.rating, r.reviewed_at, r.duration_ms, r.study_mode,
+                   r.previous_state, r.new_state
+            FROM reviews r JOIN cards c ON c.id = r.card_id
+            WHERE c.deck_id IN (\(placeholders))
+            ORDER BY r.reviewed_at ASC
+            """,
+            ids.map { .int($0) }
+        ) { Self.rowToReview($0) }
+    }
+
+    public func allChronological() throws -> [ReviewLog] {
+        try db.query("\(Self.select) ORDER BY reviewed_at ASC") { Self.rowToReview($0) }
+    }
+
     /// Most recent review log in the whole store (for session undo).
     public func mostRecent() throws -> ReviewLog? {
         try db.query("\(Self.select) ORDER BY id DESC LIMIT 1") { Self.rowToReview($0) }.first

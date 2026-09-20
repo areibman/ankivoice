@@ -62,7 +62,7 @@ final class VoiceSelectionUITests: XCTestCase {
             ("pauseWhenHeadphonesDisconnect", { _ = $0.pauseWhenHeadphonesDisconnect }, { $0.pauseWhenHeadphonesDisconnect = false }),
             ("simplifiedRatings", { _ = $0.simplifiedRatings }, { $0.simplifiedRatings = true }),
             ("commandLocale", { _ = $0.commandLocale }, { $0.commandLocale = "en-GB" }),
-            ("voiceQuality", { _ = $0.voiceQuality }, { $0.voiceQuality = .enhanced }),
+            ("sampleContentSeeded", { _ = $0.sampleContentSeeded }, { $0.sampleContentSeeded = true }),
             ("speechRate", { _ = $0.speechRate }, { $0.speechRate = 1.3 }),
             ("defaultVoices", { _ = $0.defaultVoices }, { $0.defaultVoices = ["ja": "kyoko"] }),
             ("ankiConnectHost", { _ = $0.ankiConnectHost }, { $0.ankiConnectHost = "mac.local" }),
@@ -104,7 +104,6 @@ final class VoiceSelectionUITests: XCTestCase {
         XCTAssertFalse(status.isExplicit)
         XCTAssertFalse(status.isNatural)
         XCTAssertNil(status.betterInstalled)
-        XCTAssertEqual(status.summary, "Samantha · built-in")
     }
 
     /// Tapping a voice in the picker must be reflected as *that* voice,
@@ -168,11 +167,24 @@ final class VoiceSelectionUITests: XCTestCase {
         XCTAssertFalse(status.isExplicit)
     }
 
+    func testSupertonicPickIsNaturalAndExplicit() {
+        let settings = makeSettings()
+        let f1 = VoiceCatalogVoice(identifier: "supertonic3:F1", name: "Female 1", language: "en-US", quality: .premium, kind: .supertonic3)
+        settings.setDefaultVoice(f1.identifier, forLocale: "en-US")
+        let status = VoiceQualityStatus(locale: "en-US", inventory: inventory([samantha, f1]), settings: settings)
+        XCTAssertEqual(status.voice, f1)
+        XCTAssertTrue(status.isExplicit)
+        XCTAssertTrue(status.isNatural)
+        XCTAssertTrue(status.isPremium)
+        XCTAssertNil(status.betterInstalled)
+        XCTAssertEqual(inventory([samantha, f1]).automaticVoice(for: "en-US"), samantha)
+    }
+
     func testMissingLanguage() {
         let status = VoiceQualityStatus(locale: "fr-FR", inventory: inventory([samantha]), settings: makeSettings())
-        XCTAssertTrue(status.isMissing)
+        XCTAssertNil(status.voice)
         XCTAssertFalse(status.isNatural)
-        XCTAssertEqual(status.summary, "No voice installed")
+        XCTAssertFalse(status.isExplicit)
     }
 
     // MARK: VoiceInventory helpers

@@ -90,7 +90,7 @@ struct AddDeckView: View {
                 BigActionCard(
                     icon: "square.and.arrow.down", tint: .green,
                     title: "Import a file",
-                    subtitle: "An .apkg exported from Anki, or a CSV / TSV spreadsheet"
+                    subtitle: "An .apkg or .colpkg from Anki, or a CSV / TSV spreadsheet"
                 )
             }
             .buttonStyle(.plain)

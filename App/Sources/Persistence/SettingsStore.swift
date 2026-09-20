@@ -51,12 +51,13 @@ public final class SettingsStore {
         static let pauseWhenHeadphonesDisconnect = "pauseWhenHeadphonesDisconnect"
         static let simplifiedRatings = "simplifiedRatings"
         static let commandLocale = "commandLocale"
-        static let voiceQuality = "voiceQuality"
+        static let sampleContentSeeded = "sampleContentSeeded"
         static let speechRate = "speechRate"
         static let defaultVoices = "defaultVoices"
         static let ankiConnectHost = "ankiConnectHost"
         static let ankiConnectPort = "ankiConnectPort"
         static let ankiConnectKey = "ankiConnectKey"
+        static let fsrsParameters = "fsrsParameters"
     }
 
     // MARK: Properties
@@ -64,6 +65,13 @@ public final class SettingsStore {
     public var onboardingComplete: Bool {
         get { read(\.onboardingComplete) { defaults.bool(forKey: Key.onboardingComplete) } }
         set { write(\.onboardingComplete) { defaults.set(newValue, forKey: Key.onboardingComplete) } }
+    }
+
+    /// Whether the Tutorial and Starter decks have been created once. Set
+    /// after the first seed so deleting them doesn't bring them back.
+    public var sampleContentSeeded: Bool {
+        get { read(\.sampleContentSeeded) { defaults.bool(forKey: Key.sampleContentSeeded) } }
+        set { write(\.sampleContentSeeded) { defaults.set(newValue, forKey: Key.sampleContentSeeded) } }
     }
 
     /// Endpoint silence profile (PRD §14): fast ≈ 500 ms, normal ≈ 700 ms, patient ≈ 900 ms.
@@ -149,24 +157,6 @@ public final class SettingsStore {
         set { write(\.commandLocale) { defaults.set(newValue, forKey: Key.commandLocale) } }
     }
 
-    /// Preferred TTS voice quality. Premium voices (e.g. "Ava Premium") sound
-    /// noticeably more natural than the default compact voice.
-    public enum VoiceQuality: String, CaseIterable, Identifiable, Sendable, Codable {
-        case auto, premium, enhanced
-        public var id: String { rawValue }
-        public var title: String {
-            switch self {
-            case .auto: return "Best available"
-            case .premium: return "Prefer Premium"
-            case .enhanced: return "Prefer Enhanced"
-            }
-        }
-    }
-    public var voiceQuality: VoiceQuality {
-        get { read(\.voiceQuality) { VoiceQuality(rawValue: defaults.string(forKey: Key.voiceQuality) ?? "") ?? .auto } }
-        set { write(\.voiceQuality) { defaults.set(newValue.rawValue, forKey: Key.voiceQuality) } }
-    }
-
     /// Global speaking-speed multiplier (1.0 = the system default rate).
     /// Decks use this unless they set their own rate.
     public var speechRate: Double {
@@ -193,6 +183,22 @@ public final class SettingsStore {
     /// picked one for that language.
     public func defaultVoice(forLocale locale: String) -> String? {
         defaultVoices[Self.languageKey(for: locale)]
+    }
+
+    /// The voice this side should use when the user hasn't pinned one.
+    ///
+    /// A pick for this language wins. Otherwise a Supertonic speaker already
+    /// chosen for any language carries over: those ten voices are the same
+    /// person in every language, so changing the front from English to
+    /// Japanese must not hop to a different Apple voice.
+    public func effectiveDefaultVoice(forLocale locale: String) -> String? {
+        if let chosen = defaultVoice(forLocale: locale) { return chosen }
+        let key = Self.languageKey(for: locale)
+        guard SupertonicVoiceCatalog.supports(languageKey: key) else { return nil }
+        return defaultVoices.values
+            .filter(SupertonicVoiceCatalog.isSupertonic)
+            .sorted()
+            .first
     }
 
     /// Records (or clears, when `identifier` is nil) the default voice for
@@ -237,6 +243,26 @@ public final class SettingsStore {
     public var ankiConnectKey: String {
         get { read(\.ankiConnectKey) { defaults.string(forKey: Key.ankiConnectKey) ?? "" } }
         set { write(\.ankiConnectKey) { defaults.set(newValue, forKey: Key.ankiConnectKey) } }
+    }
+
+    /// Collection-wide FSRS-6 weights from Optimize. Deck settings override this.
+    public var fsrsParameters: [Double]? {
+        get {
+            read(\.fsrsParameters) {
+                guard let data = defaults.data(forKey: Key.fsrsParameters) else { return nil }
+                let values = try? JSONDecoder().decode([Double].self, from: data)
+                return values?.count == 21 ? values : nil
+            }
+        }
+        set {
+            write(\.fsrsParameters) {
+                if let newValue, newValue.count == 21, let data = try? JSONEncoder().encode(newValue) {
+                    defaults.set(data, forKey: Key.fsrsParameters)
+                } else {
+                    defaults.removeObject(forKey: Key.fsrsParameters)
+                }
+            }
+        }
     }
 
     // MARK: Helpers

@@ -156,16 +156,27 @@ final class ZipArchiveTests: XCTestCase {
         }
     }
 
-    func testUnsupportedMethodNamesTheEntry() throws {
+    func testZstdZipMethodRejectsGarbage() throws {
         let zip = try ZipReader(data: makeZip(entries: [("collection.anki21b", Data([1, 2, 3]), 93, 3)]))
         XCTAssertThrowsError(try zip.extract("collection.anki21b")) { error in
-            guard case ZipReader.ZipError.unsupportedMethod(let method, let entry) = error else {
+            guard case ZipReader.ZipError.corruptEntry(let entry) = error else {
                 return XCTFail("unexpected error \(error)")
             }
-            XCTAssertEqual(method, 93)
             XCTAssertEqual(entry, "collection.anki21b")
-            XCTAssertTrue(error.localizedDescription.contains("legacy"))
         }
+    }
+
+    func testZstdFrameRoundTrip() throws {
+        let hex = "28b52ffd045851000068656c6c6f207a737464cfdb609c"
+        var bytes = Data()
+        var index = hex.startIndex
+        while index < hex.endIndex {
+            let next = hex.index(index, offsetBy: 2)
+            bytes.append(UInt8(hex[index..<next], radix: 16)!)
+            index = next
+        }
+        XCTAssertTrue(Zstd.isFrame(bytes))
+        XCTAssertEqual(try Zstd.decompress(bytes), Data("hello zstd".utf8))
     }
 
     func testWriterRoundTrip() throws {
@@ -598,5 +609,242 @@ final class ExportServiceTests: XCTestCase {
         let csv = ExportService().exportCSV(cards: all, includeProgress: true)
         XCTAssertTrue(csv.contains("Stability"))
         XCTAssertTrue(csv.contains("new"))
+    }
+}
+
+final class ApkgExporterTests: XCTestCase {
+
+    private func makeStores() throws -> (SQLiteDatabase, DeckRepository, CardRepository, ReviewRepository) {
+        let db = try SQLiteDatabase.inMemory()
+        try Schema.migrate(db: db)
+        return (db, DeckRepository(db: db), CardRepository(db: db), ReviewRepository(db: db))
+    }
+
+    private func seedReviewedCard(
+        decks: DeckRepository, cards: CardRepository, reviews: ReviewRepository
+    ) throws -> (Deck, Card) {
+        let deck = try decks.create(fullName: "Languages::Japanese")
+        let note = try cards.createNote(
+            fields: ["食べる", "to eat"], tags: ["core", "vocab"], deckID: deck.id
+        )
+        let card = try XCTUnwrap(try cards.cards(forNote: note.id).first)
+        let reviewedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let due = Date(timeIntervalSince1970: 1_700_000_000 + 12.5 * 86_400)
+        let after = SchedulingState(
+            kind: .review, stability: 12.5, difficulty: 5.2,
+            due: due, lastReview: reviewedAt, lapses: 0, reps: 2
+        )
+        try cards.replaceScheduling(after, cardID: card.id)
+        _ = try reviews.append(ReviewLog(
+            id: 0, cardID: card.id, rating: .good, reviewedAt: reviewedAt,
+            durationMs: 3_000, studyMode: .touch,
+            previousState: SchedulingState(), newState: after
+        ))
+        _ = try reviews.append(ReviewLog(
+            id: 0, cardID: card.id, rating: .easy,
+            reviewedAt: reviewedAt.addingTimeInterval(86_400),
+            durationMs: 1_200, studyMode: .voice,
+            previousState: after, newState: after
+        ))
+        return (deck, try XCTUnwrap(try cards.card(id: card.id)))
+    }
+
+    func testApkgRoundTripPreservesSchedulingAndHistory() throws {
+        let (_, decks, cards, reviews) = try makeStores()
+        let (deck, _) = try seedReviewedCard(decks: decks, cards: cards, reviews: reviews)
+
+        let geo = try decks.create(fullName: "Geography")
+        let geoNote = try cards.createNote(fields: ["Capital of France?", "Paris"], deckID: geo.id)
+        let geoCard = try XCTUnwrap(try cards.cards(forNote: geoNote.id).first)
+        try cards.setSuspended(true, cardID: geoCard.id)
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let exporter = ApkgExporter(decks: decks, cards: cards, reviews: reviews)
+        let exported = try exporter.exportDeck(id: deck.id, to: dir)
+        XCTAssertEqual(exported.notesExported, 1)
+        XCTAssertEqual(exported.cardsExported, 1)
+        XCTAssertEqual(exported.reviewsExported, 2)
+        XCTAssertEqual(exported.url.pathExtension, "apkg")
+
+        let zip = try ZipReader(data: try Data(contentsOf: exported.url))
+        XCTAssertNotNil(zip.entry(named: "collection.anki2"))
+        XCTAssertNotNil(zip.entry(named: "media"))
+
+        let (_, inDecks, inCards, inReviews) = try makeStores()
+        let imported = try ApkgImporter(decks: inDecks, cards: inCards, reviews: inReviews)
+            .importPackage(zip: zip)
+        XCTAssertEqual(imported.notesImported, 1)
+        XCTAssertEqual(imported.reviewsImported, 2)
+
+        let vocab = try XCTUnwrap(try inDecks.deck(named: "Languages::Japanese"))
+        let vocabCards = try inCards.cards(inDeck: vocab.id)
+        XCTAssertEqual(vocabCards.count, 1)
+        let reviewed = try XCTUnwrap(vocabCards.first)
+        XCTAssertEqual(reviewed.scheduling.kind, .review)
+        XCTAssertEqual(reviewed.scheduling.stability ?? 0, 12.5, accuracy: 1e-9)
+        XCTAssertEqual(reviewed.scheduling.difficulty ?? 0, 5.2, accuracy: 1e-9)
+        XCTAssertEqual(try inReviews.history(forCard: reviewed.id).count, 2)
+
+        XCTAssertNil(try inDecks.deck(named: "Geography"), "deck export must not include sibling decks")
+    }
+
+    func testCardsOnlyExportStripsScheduling() throws {
+        let (_, decks, cards, reviews) = try makeStores()
+        let (deck, _) = try seedReviewedCard(decks: decks, cards: cards, reviews: reviews)
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let exported = try ApkgExporter(decks: decks, cards: cards, reviews: reviews)
+            .exportDeck(id: deck.id, options: .cardsOnly, to: dir)
+        XCTAssertEqual(exported.reviewsExported, 0)
+
+        let (_, inDecks, inCards, inReviews) = try makeStores()
+        _ = try ApkgImporter(decks: inDecks, cards: inCards, reviews: inReviews)
+            .importPackage(zip: ZipReader(data: try Data(contentsOf: exported.url)))
+        let vocab = try XCTUnwrap(try inDecks.deck(named: "Languages::Japanese"))
+        let imported = try XCTUnwrap(try inCards.cards(inDeck: vocab.id).first)
+        XCTAssertEqual(imported.scheduling.kind, .new)
+        XCTAssertNil(imported.scheduling.stability)
+        XCTAssertEqual(try inReviews.history(forCard: imported.id).count, 0)
+    }
+
+    func testCollectionExportIncludesEveryDeckAndUsesColpkg() throws {
+        let (_, decks, cards, reviews) = try makeStores()
+        _ = try seedReviewedCard(decks: decks, cards: cards, reviews: reviews)
+        _ = try decks.create(fullName: "Empty")
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let exported = try ApkgExporter(decks: decks, cards: cards, reviews: reviews)
+            .exportCollection(to: dir)
+        XCTAssertEqual(exported.url.pathExtension, "colpkg")
+        XCTAssertEqual(exported.notesExported, 1)
+
+        let (_, inDecks, inCards, inReviews) = try makeStores()
+        _ = try ApkgImporter(decks: inDecks, cards: inCards, reviews: inReviews)
+            .importPackage(at: exported.url)
+        XCTAssertNotNil(try inDecks.deck(named: "Languages::Japanese"))
+        XCTAssertNotNil(try inDecks.deck(named: "Empty"))
+    }
+
+    func testExportIncludesReferencedMedia() throws {
+        let (_, decks, cards, reviews) = try makeStores()
+        let deck = try decks.create(fullName: "Audio")
+        _ = try cards.createNote(
+            fields: ["[sound:export-test.mp3]", "a clip"], deckID: deck.id
+        )
+
+        let mediaDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("media-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: mediaDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: mediaDir) }
+        try Data("fake-mp3".utf8).write(to: mediaDir.appendingPathComponent("export-test.mp3"))
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let exported = try ApkgExporter(decks: decks, cards: cards, reviews: reviews)
+            .exportDeck(id: deck.id, mediaDirectory: mediaDir, to: dir)
+        XCTAssertEqual(exported.mediaExported, 1)
+
+        let zip = try ZipReader(data: try Data(contentsOf: exported.url))
+        let mapping = try JSONDecoder().decode([String: String].self, from: zip.extract("media"))
+        XCTAssertEqual(Array(mapping.values), ["export-test.mp3"])
+        XCTAssertEqual(try zip.extract("0"), Data("fake-mp3".utf8))
+    }
+
+    func testChildDecksAreIncluded() throws {
+        let (_, decks, cards, reviews) = try makeStores()
+        let parent = try decks.create(fullName: "Parent")
+        let child = try decks.create(fullName: "Parent::Child")
+        _ = try cards.createNote(fields: ["Q", "A"], deckID: child.id)
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let exported = try ApkgExporter(decks: decks, cards: cards, reviews: reviews)
+            .exportDeck(id: parent.id, to: dir)
+        XCTAssertEqual(exported.notesExported, 1)
+
+        let (_, inDecks, inCards, inReviews) = try makeStores()
+        _ = try ApkgImporter(decks: inDecks, cards: inCards, reviews: inReviews)
+            .importPackage(at: exported.url)
+        XCTAssertNotNil(try inDecks.deck(named: "Parent::Child"))
+        let importedChild = try XCTUnwrap(try inDecks.deck(named: "Parent::Child"))
+        XCTAssertEqual(try inCards.cards(inDeck: importedChild.id).count, 1)
+    }
+
+    func testRelationalZstdSchemaImport() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("rel-\(UUID().uuidString).sqlite")
+        let source = try SQLiteDatabase.open(url: url)
+        try source.execute("CREATE TABLE col (id INTEGER PRIMARY KEY, crt REAL)")
+        try source.execute("CREATE TABLE decks (id INTEGER PRIMARY KEY, name TEXT)")
+        try source.execute("CREATE TABLE notetypes (id INTEGER PRIMARY KEY, name TEXT, config BLOB)")
+        try source.execute("CREATE TABLE fields (ntid INTEGER, ord INTEGER, name TEXT)")
+        try source.execute("CREATE TABLE templates (ntid INTEGER, ord INTEGER, name TEXT, config BLOB)")
+        try source.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, guid TEXT, mid INTEGER, tags TEXT, flds TEXT, mod REAL)")
+        try source.execute("CREATE TABLE cards (id INTEGER PRIMARY KEY, nid INTEGER, did INTEGER, ord INTEGER, type INTEGER, queue INTEGER, due REAL, ivl INTEGER, factor INTEGER, reps INTEGER, lapses INTEGER, data TEXT)")
+        try source.execute("CREATE TABLE revlog (id INTEGER, cid INTEGER, ease INTEGER, time INTEGER, type INTEGER)")
+        try source.run("INSERT INTO col (id, crt) VALUES (1, ?)", [.double(1_600_000_000)])
+        try source.run("INSERT INTO decks (id, name) VALUES (10, ?)", [.text("Languages::Japanese")])
+        var noteConfig = Data()
+        ProtobufWriter.appendVarint(1, field: 1, to: &noteConfig)
+        try source.run("INSERT INTO notetypes (id, name, config) VALUES (5, ?, ?)", [.text("Cloze"), .blob(noteConfig)])
+        try source.run("INSERT INTO fields (ntid, ord, name) VALUES (5, 0, 'Text'), (5, 1, 'Back Extra')")
+        var templateConfig = Data()
+        ProtobufWriter.appendString("{{cloze:Text}}", field: 1, to: &templateConfig)
+        ProtobufWriter.appendString("{{cloze:Text}}<hr>{{Back Extra}}", field: 2, to: &templateConfig)
+        try source.run(
+            "INSERT INTO templates (ntid, ord, name, config) VALUES (5, 0, 'Cloze', ?)",
+            [.blob(templateConfig)]
+        )
+        try source.run(
+            "INSERT INTO notes (id, guid, mid, tags, flds, mod) VALUES (1, 'g', 5, 'vocab', ?, 1)",
+            [.text("The {{c1::cat}}\u{1f}noun")]
+        )
+        try source.run(
+            "INSERT INTO cards (id, nid, did, ord, type, queue, due, ivl, factor, reps, lapses, data) VALUES (1, 1, 10, 0, 0, 0, 0, 0, 0, 0, 0, '')"
+        )
+        try source.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        try source.execute("PRAGMA journal_mode=DELETE")
+        let dbData = try Data(contentsOf: url)
+        // collection.anki21b is a zstd frame in real packages. This fixture is
+        // the decoded SQLite so the relational reader is what's under test;
+        // the frame decoder is covered by testZstdFrameRoundTrip.
+        var writer = ZipWriter()
+        writer.add(name: "collection.anki21b", data: dbData)
+        writer.add(name: "media", data: Data("{}".utf8))
+        let package = FileManager.default.temporaryDirectory.appendingPathComponent("rel-\(UUID().uuidString).colpkg")
+        try writer.finalize().write(to: package)
+        defer { try? FileManager.default.removeItem(at: package) }
+
+        let (_, decks, cards, reviews) = try makeStores()
+        let result = try ApkgImporter(decks: decks, cards: cards, reviews: reviews).importPackage(at: package)
+        XCTAssertEqual(result.notesImported, 1)
+        XCTAssertNotNil(try decks.deck(named: "Languages::Japanese"))
+        let imported = try XCTUnwrap(try cards.allStudyCards().first { $0.note.guid == "g" })
+        XCTAssertEqual(imported.noteType.kind, .cloze)
+        XCTAssertEqual(imported.noteType.templates.first?.questionFormat, "{{cloze:Text}}")
+        XCTAssertTrue(imported.note.fields[0].contains("cat"))
+    }
+
+    func testMediaFilenameParsing() {
+        XCTAssertEqual(
+            ApkgExporter.mediaFilenames(in: ["[sound:foo.mp3]", #"<img src="bar.jpg">"#]),
+            ["foo.mp3", "bar.jpg"]
+        )
+        XCTAssertEqual(
+            ApkgExporter.mediaFilenames(in: [#"<img src="https://example.com/x.png">"#]),
+            []
+        )
     }
 }

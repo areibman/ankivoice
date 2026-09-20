@@ -12,7 +12,6 @@ public final class SQLiteDatabase: @unchecked Sendable {
         case prepare(sql: String, message: String)
         case step(sql: String, message: String)
         case bind(sql: String, index: Int, message: String)
-        case corrupt
 
         public var description: String {
             switch self {
@@ -20,7 +19,6 @@ public final class SQLiteDatabase: @unchecked Sendable {
             case .prepare(let sql, let message): return "sqlite prepare failed: \(sql) — \(message)"
             case .step(let sql, let message): return "sqlite step failed: \(sql) — \(message)"
             case .bind(let sql, let index, let message): return "sqlite bind failed: \(sql) @\(index) — \(message)"
-            case .corrupt: return "sqlite database corrupt"
             }
         }
     }
@@ -276,6 +274,7 @@ extension SQLiteValue {
     public static func optionalDate(_ d: Date?) -> SQLiteValue { d.map { .double($0.timeIntervalSince1970) } ?? .null }
     public static func optionalText(_ s: String?) -> SQLiteValue { s.map { .text($0) } ?? .null }
     public static func optionalInt(_ i: Int?) -> SQLiteValue { i.map { .int(Int64($0)) } ?? .null }
+    public static func optionalInt64(_ i: Int64?) -> SQLiteValue { i.map { .int($0) } ?? .null }
     public static func optionalDouble(_ d: Double?) -> SQLiteValue { d.map { .double($0) } ?? .null }
 }
 
@@ -291,10 +290,6 @@ public struct Row {
 
     public func int(_ index: Int) -> Int64 {
         sqlite3_column_int64(stmt, Int32(index))
-    }
-
-    public func intOr(_ index: Int, _ fallback: Int64 = 0) -> Int64 {
-        isNull(index) ? fallback : int(index)
     }
 
     public func int32(_ index: Int) -> Int { Int(int(index)) }

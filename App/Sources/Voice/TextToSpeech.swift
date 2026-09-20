@@ -16,13 +16,20 @@ public final class TextToSpeech: NSObject, AVSpeechSynthesizerDelegate {
     private var continuations: [(utterance: ObjectIdentifier, continuation: CheckedContinuation<Void, Never>)] = []
     private var playerContinuations: [CheckedContinuation<Void, Never>] = []
     private var audioPlayer: AVAudioPlayer?
-    private var mediaDirectory: URL?
+    /// Where `.media` segments are resolved; nil skips recorded audio.
+    private let mediaDirectory: URL?
     private var warmedUp = false
+    /// Bumped by `stopSpeaking()` so an in-flight neural synthesis is dropped.
+    private var neuralGeneration = 0
+    /// Set by `stopSpeaking()` so a cancelled `speak()` doesn't continue
+    /// to the next segment after a long neural inference returns.
+    private var stopped = false
 
     /// Voice catalog dependency (injected for tests).
-    var catalog: VoiceCatalogProtocol = SystemVoiceCatalog()
+    var catalog: VoiceCatalogProtocol = AppVoiceCatalog()
 
-    public override init() {
+    public init(mediaDirectory: URL? = nil) {
+        self.mediaDirectory = mediaDirectory
         super.init()
         synthesizer.delegate = self
     }
@@ -33,7 +40,9 @@ public final class TextToSpeech: NSObject, AVSpeechSynthesizerDelegate {
     /// session controller interrupts.
     public func speak(_ segments: [SpeechRenderer.Segment], config: VoiceConfig) async {
         guard !segments.isEmpty else { return }
+        stopped = false
         for segment in segments {
+            if stopped { return }
             switch segment {
             case .speech(let text, let locale):
                 await speakText(text, locale: locale, config: config)
@@ -47,9 +56,14 @@ public final class TextToSpeech: NSObject, AVSpeechSynthesizerDelegate {
 
     /// Speaks a short sample with a specific voice (voice picker preview).
     /// Interrupts any current speech.
-    public func preview(voiceIdentifier: String, text: String, rate: Double) async {
+    public func preview(voiceIdentifier: String, text: String, rate: Double, locale: String = "en-US") async {
         stopSpeaking()
+        stopped = false
         Self.ensurePlaybackSession()
+        if SupertonicVoiceCatalog.isSupertonic(voiceIdentifier) {
+            await speakSupertonic(text: text, locale: locale, voiceIdentifier: voiceIdentifier, rate: rate)
+            return
+        }
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(identifier: voiceIdentifier)
         utterance.rate = Self.utteranceRate(multiplier: rate)
@@ -64,14 +78,29 @@ public final class TextToSpeech: NSObject, AVSpeechSynthesizerDelegate {
     ///   language (Settings ▸ Voices), so previews sound like sessions will.
     ///   Ignored when it isn't installed or doesn't speak `locale`.
     public func previewText(_ text: String, locale: String, rate: Double, preferredVoice: String? = nil) async {
+        await previewRuns([(text: text, locale: locale, voice: preferredVoice)], rate: rate)
+    }
+
+    /// Speaks each run in order. Callers that want one speaker pass the same
+    /// voice on every run; the locale is only how that speaker pronounces
+    /// the chunk (Supertonic), not a reason to pick someone else.
+    public func previewRuns(_ runs: [(text: String, locale: String, voice: String?)], rate: Double) async {
         stopSpeaking()
+        stopped = false
         Self.ensurePlaybackSession()
-        let config = VoiceConfig(questionLocale: locale, answerLocale: locale, questionVoice: preferredVoice, answerVoice: preferredVoice)
-        let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = voice(locale: locale, config: config)
-        utterance.rate = Self.utteranceRate(multiplier: rate)
-        utterance.prefersAssistiveTechnologySettings = false
-        await speakAndWait(utterance)
+        for run in runs {
+            if stopped { return }
+            let trimmed = run.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let config = VoiceConfig(
+                questionLocale: run.locale,
+                answerLocale: run.locale,
+                questionVoice: run.voice,
+                speechRate: rate,
+                activeSide: .question
+            )
+            await speakText(trimmed, locale: run.locale, config: config)
+        }
     }
 
     /// Queues `utterance` and suspends until it finishes or is cancelled.
@@ -83,14 +112,14 @@ public final class TextToSpeech: NSObject, AVSpeechSynthesizerDelegate {
     }
 
     public func stopSpeaking() {
+        stopped = true
+        neuralGeneration += 1
         if synthesizer.isSpeaking || synthesizer.isPaused {
             synthesizer.stopSpeaking(at: .immediate)
         }
         audioPlayer?.stop()
         resumeAll()
     }
-
-    public var isSpeaking: Bool { synthesizer.isSpeaking }
 
     /// Warms the synthesis engine with an empty utterance to avoid first-
     /// utterance latency on real devices.
@@ -113,25 +142,40 @@ public final class TextToSpeech: NSObject, AVSpeechSynthesizerDelegate {
     /// Resolves the voice identifier for one utterance.
     ///
     /// Order of precedence:
-    /// 1. The deck's explicit voice for the side being spoken, when it is
-    ///    installed and speaks the segment's language.
-    /// 2. The best automatic voice for the locale (see `VoiceSelector`).
+    /// 1. The voice chosen for this side of the card, if it is still
+    ///    installed. It stays for the whole side — a Japanese deck must not
+    ///    swap speakers every time a gloss, reading, or kanji run is detected
+    ///    as another language.
+    /// 2. The user's default voice for the utterance's language.
+    /// 3. The best automatic voice for the locale (see `VoiceSelector`).
     func selectVoice(locale: String, config: VoiceConfig) -> String? {
         let languageKey = SettingsStore.languageKey(for: locale)
         let localized = catalog.voices(matching: languageKey)
+        let installed = catalog.voices(matching: "")
 
         let side: SpeechSide = config.activeSide
             ?? (locale == config.questionLocale ? .question : .answer)
-        if let explicit = config.explicitVoice(for: side), !explicit.isEmpty,
-           let match = localized.first(where: { $0.identifier == explicit }) {
-            return match.identifier
+        func known(_ identifier: String?, in voices: [VoiceCatalogVoice]) -> String? {
+            guard let identifier, !identifier.isEmpty else { return nil }
+            return voices.first { $0.identifier == identifier }?.identifier
+        }
+        if let match = known(config.explicitVoice(for: side), in: installed) { return match }
+        if let match = known(config.languageVoices[languageKey], in: localized) { return match }
+        // The user picked one Supertonic speaker for some other language.
+        // Keep that person when this language has no pick of its own.
+        if SupertonicVoiceCatalog.supports(languageKey: languageKey),
+           let carried = config.languageVoices.values
+            .filter(SupertonicVoiceCatalog.isSupertonic)
+            .sorted()
+            .first,
+           let match = known(carried, in: installed) {
+            return match
         }
 
         return VoiceSelector.best(
             localized: localized,
             allVoices: catalog.voices(matching: ""),
-            requestedLocale: locale,
-            preferredQuality: config.preferredQuality
+            requestedLocale: locale
         )
     }
 
@@ -145,12 +189,63 @@ public final class TextToSpeech: NSObject, AVSpeechSynthesizerDelegate {
     }
 
     private func speakText(_ text: String, locale: String, config: VoiceConfig) async {
+        if let identifier = selectVoice(locale: locale, config: config),
+           SupertonicVoiceCatalog.isSupertonic(identifier) {
+            await speakSupertonic(text: text, locale: locale, voiceIdentifier: identifier, rate: config.speechRate)
+            return
+        }
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = voice(locale: locale, config: config)
         utterance.rate = Self.utteranceRate(multiplier: config.speechRate)
         utterance.postUtteranceDelay = 0
         utterance.prefersAssistiveTechnologySettings = false
         await speakAndWait(utterance)
+    }
+
+    /// Runs Supertonic 3 and plays the resulting PCM. Falls back to the
+    /// system voice if the model isn't ready or synthesis fails, so a
+    /// study session never stalls on a download error.
+    private func speakSupertonic(
+        text: String,
+        locale: String,
+        voiceIdentifier: String,
+        rate: Double
+    ) async {
+        neuralGeneration += 1
+        let generation = neuralGeneration
+        do {
+            let result = try await SupertonicTTS.shared.synthesize(
+                text: text,
+                locale: locale,
+                voiceIdentifier: voiceIdentifier,
+                speed: rate
+            )
+            guard generation == neuralGeneration, !stopped else { return }
+            await playPCM(result.samples, sampleRate: result.sampleRate)
+        } catch {
+            guard generation == neuralGeneration, !stopped else { return }
+            let utterance = AVSpeechUtterance(string: text)
+            utterance.voice = AVSpeechSynthesisVoice(language: locale)
+            utterance.rate = Self.utteranceRate(multiplier: rate)
+            utterance.prefersAssistiveTechnologySettings = false
+            await speakAndWait(utterance)
+        }
+    }
+
+    private func playPCM(_ samples: [Float], sampleRate: Int) async {
+        guard !samples.isEmpty else { return }
+        let data = PCMWav.data(samples: samples, sampleRate: sampleRate)
+        await withCheckedContinuation { continuation in
+            do {
+                let player = try AVAudioPlayer(data: data)
+                player.delegate = self
+                self.audioPlayer = player
+                playerContinuations.append(continuation)
+                player.play()
+            } catch {
+                continuation.resume()
+            }
+        }
     }
 
     /// Maps the 0.5…2.0 user multiplier onto AVSpeechUtterance's rate range.
@@ -170,30 +265,24 @@ public final class TextToSpeech: NSObject, AVSpeechSynthesizerDelegate {
     }
 
     /// Pure selector: pick the best voice identifier for the requested
-    /// locale and quality preference. No AVFoundation calls — safe to unit test
-    /// with an `InMemoryVoiceCatalog`.
+    /// locale. No AVFoundation calls — safe to unit test with an
+    /// `InMemoryVoiceCatalog`.
     enum VoiceSelector {
         /// Picks the best voice for `requestedLocale`.
         ///
         /// Language match always beats quality: a premium Japanese voice must
         /// never be chosen to read English. Within the requested language,
-        /// quality tiers are walked from the preferred one down, preferring the
-        /// exact regional variant inside each tier. Novelty and personal
-        /// voices are never auto-selected. Only when the language has no
-        /// usable voice at all do we fall back to the best voice in any
-        /// language, so the text is still spoken.
+        /// quality tiers are walked from Premium down, preferring the exact
+        /// regional variant inside each tier. Novelty and personal voices are
+        /// never auto-selected. Only when the language has no usable voice at
+        /// all do we fall back to the best voice in any language, so the text
+        /// is still spoken.
         static func best(
             localized: [VoiceCatalogVoice],
             allVoices: [VoiceCatalogVoice],
-            requestedLocale: String,
-            preferredQuality: SettingsStore.VoiceQuality
+            requestedLocale: String
         ) -> String? {
-            let tiers: [VoiceQualityTier] = {
-                switch preferredQuality {
-                case .premium, .auto: return [.premium, .enhanced, .compact]
-                case .enhanced: return [.enhanced, .premium, .compact]
-                }
-            }()
+            let tiers: [VoiceQualityTier] = [.premium, .enhanced, .compact]
 
             let eligible = localized.filter(\.isAutoEligible)
             let exact = eligible.filter { $0.language.caseInsensitiveCompare(requestedLocale) == .orderedSame }
@@ -212,10 +301,7 @@ public final class TextToSpeech: NSObject, AVSpeechSynthesizerDelegate {
 
     // MARK: - Media
 
-    public func setMediaDirectory(_ url: URL?) {
-        self.mediaDirectory = url
-    }
-
+    /// Plays an imported recording; silently skips files that aren't there.
     private func playMedia(_ filename: String) async {
         guard let dir = mediaDirectory else { return }
         let sanitized = filename.replacingOccurrences(of: "/", with: "_")
@@ -285,5 +371,37 @@ extension TextToSpeech: AVAudioPlayerDelegate {
                 self.playerContinuations.removeFirst().resume()
             }
         }
+    }
+}
+
+/// 16-bit PCM WAV, little-endian. Compact enough to hand to AVAudioPlayer.
+enum PCMWav {
+    static func data(samples: [Float], sampleRate: Int) -> Data {
+        let dataSize = samples.count * MemoryLayout<Int16>.size
+        var header = Data()
+        header.append(contentsOf: Array("RIFF".utf8))
+        withUnsafeBytes(of: UInt32(36 + dataSize).littleEndian) { header.append(contentsOf: $0) }
+        header.append(contentsOf: Array("WAVE".utf8))
+        header.append(contentsOf: Array("fmt ".utf8))
+        withUnsafeBytes(of: UInt32(16).littleEndian) { header.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt16(1).littleEndian) { header.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt16(1).littleEndian) { header.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt32(sampleRate).littleEndian) { header.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt32(sampleRate * 2).littleEndian) { header.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt16(2).littleEndian) { header.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt16(16).littleEndian) { header.append(contentsOf: $0) }
+        header.append(contentsOf: Array("data".utf8))
+        withUnsafeBytes(of: UInt32(dataSize).littleEndian) { header.append(contentsOf: $0) }
+
+        var pcm = Data(count: dataSize)
+        pcm.withUnsafeMutableBytes { raw in
+            let dest = raw.bindMemory(to: Int16.self)
+            for i in samples.indices {
+                let clipped = max(-1, min(1, samples[i]))
+                dest[i] = Int16((clipped * Float(Int16.max)).rounded())
+            }
+        }
+        header.append(pcm)
+        return header
     }
 }

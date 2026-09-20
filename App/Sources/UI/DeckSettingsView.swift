@@ -11,6 +11,8 @@ struct DeckSettingsView: View {
     @State private var voice = VoiceConfig()
     @State private var loaded = false
     @State private var installedVoices: [VoiceCatalogVoice] = []
+    @State private var optimizing = false
+    @State private var optimizeMessage: String?
 
     var body: some View {
         Form {
@@ -63,19 +65,7 @@ struct DeckSettingsView: View {
             } header: {
                 Text("Voices")
             } footer: {
-                Text("Leave voices on Default to use the ones chosen in Settings ▸ Voices.")
-            }
-
-            Section {
-                Picker("Answer pause", selection: $voice.endpointDelayMs) {
-                    Text("Short (0.5s)").tag(500)
-                    Text("Normal (0.7s)").tag(700)
-                    Text("Long (0.9s)").tag(900)
-                }
-            } header: {
-                Text("Listening")
-            } footer: {
-                Text("How long you can pause mid-answer before the app decides you're done.")
+                Text("Leave voices on Default to use the ones chosen in Settings ▸ Voices. How long a pause ends your answer is set for all decks under Settings ▸ Response speed.")
             }
 
             Section {
@@ -95,12 +85,52 @@ struct DeckSettingsView: View {
             } header: {
                 Text("Scheduling")
             } footer: {
-                Text("Higher retention means shorter intervals and more reviews per day. 90% is a good default.")
+                Text("Higher retention means shorter intervals and more reviews per day. 90% is a good default. Intervals inside the fuzz window use Anki's load balancer.")
+            }
+
+            Section {
+                Toggle("Bury new siblings", isOn: $study.buryNewSiblings)
+                Toggle("Bury review siblings", isOn: $study.buryReviewSiblings)
+                Toggle("Bury interday learning siblings", isOn: $study.buryInterdayLearning)
+            } header: {
+                Text("Bury related cards")
+            } footer: {
+                Text("Anki's defaults: new siblings stay hidden until tomorrow, review siblings do not. Interday learning means a sibling whose next step is on a later day.")
+            }
+
+            Section {
+                easyDaysRow
+            } header: {
+                Text("Easy days")
+            } footer: {
+                Text("Part of the load balancer. Tap a day to cycle normal, reduced, and minimum. Reduced days take about half the load.")
+            }
+
+            Section {
+                Button {
+                    optimize()
+                } label: {
+                    Label(optimizing ? "Optimizing…" : "Optimize FSRS", systemImage: "function")
+                }
+                .disabled(optimizing)
+                if let optimizeMessage {
+                    Text(optimizeMessage).font(.caption).foregroundStyle(.secondary)
+                }
+            } footer: {
+                Text("Fits this deck's review history with the same FSRS-6 loss Anki's optimizer uses. Needs at least \(FSRSOptimizer.minimumReviews) reviews.")
             }
         }
         .navigationTitle("Deck Settings")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear(perform: load)
+        .onChange(of: voice.questionLocale) { old, new in
+            guard loaded else { return }
+            dropVoiceThatCannotSpeak(\.questionVoice, locale: new, previous: old)
+        }
+        .onChange(of: voice.answerLocale) { old, new in
+            guard loaded else { return }
+            dropVoiceThatCannotSpeak(\.answerVoice, locale: new, previous: old)
+        }
         .onChange(of: voice) { _, newValue in
             guard loaded else { return }
             try? services.decks.updateVoiceConfig(newValue, for: deckID)
@@ -113,19 +143,94 @@ struct DeckSettingsView: View {
 
     // MARK: Helpers
 
+    private var easyDaysRow: some View {
+        let labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        return HStack {
+            ForEach(0..<7, id: \.self) { index in
+                let value = index < study.easyDays.count ? study.easyDays[index] : 1
+                Button {
+                    var days = study.easyDays.count == 7 ? study.easyDays : Array(repeating: 1.0, count: 7)
+                    if value >= 0.99 { days[index] = 0.5 }
+                    else if value >= 0.4 { days[index] = 0 }
+                    else { days[index] = 1 }
+                    study.easyDays = days
+                } label: {
+                    Text(labels[index])
+                        .font(.caption2.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.bordered)
+                .tint(value >= 0.99 ? .accentColor : (value <= 0.01 ? .secondary : .orange))
+            }
+        }
+    }
+
+    private func optimize() {
+        optimizing = true
+        optimizeMessage = nil
+        let deckID = deckID
+        let reviews = services.reviews
+        let cards = services.cards
+        Task {
+            defer { optimizing = false }
+            do {
+                let ids = try cards.descendantDeckIDs(including: deckID)
+                let logs = try reviews.history(inDeckIDs: ids)
+                let report = try await Task.detached(priority: .userInitiated) {
+                    try FSRSOptimizer().optimize(logs: logs)
+                }.value
+                study.parameters = report.parameters
+                optimizeMessage = String(
+                    format: "Fit %d reviews. Loss %.3f → %.3f.",
+                    report.reviewCount, report.lossBefore, report.lossAfter
+                )
+            } catch let failure as FSRSOptimizer.Failure {
+                if case .notEnoughReviews(let have, let need) = failure {
+                    optimizeMessage = "Need \(need) reviews to optimize. This deck has \(have)."
+                }
+            } catch {
+                optimizeMessage = error.localizedDescription
+            }
+        }
+    }
+
     private func load() {
         let configs = (try? services.decks.config(for: deckID)) ?? (StudyConfig(), VoiceConfig(), nil)
         study = configs.0
         voice = configs.1
-        installedVoices = SystemVoiceCatalog().voices(matching: "")
+        installedVoices = AppVoiceCatalog().voices(matching: "")
         loaded = true
+    }
+
+    /// An Apple voice pinned to the old language can't read the new one.
+    /// Clearing it lets the same Supertonic speaker, if one was chosen, stay
+    /// as the default. A voice that already speaks the new language stays.
+    private func dropVoiceThatCannotSpeak(
+        _ key: WritableKeyPath<VoiceConfig, String?>,
+        locale: String,
+        previous: String
+    ) {
+        guard SettingsStore.languageKey(for: previous) != SettingsStore.languageKey(for: locale) else { return }
+        guard let current = voice[keyPath: key], !speaks(current, locale) else { return }
+        voice[keyPath: key] = nil
+    }
+
+    private func speaks(_ identifier: String, _ locale: String) -> Bool {
+        let key = SettingsStore.languageKey(for: locale)
+        if SupertonicVoiceCatalog.isSupertonic(identifier) {
+            return SupertonicVoiceCatalog.supports(languageKey: key)
+        }
+        return installedVoices.contains {
+            $0.identifier == identifier && SettingsStore.languageKey(for: $0.language) == key
+        }
     }
 
     private func voiceName(_ identifier: String?, locale: String) -> String {
         if let identifier, let match = installedVoices.first(where: { $0.identifier == identifier }) {
             return match.name
         }
-        if let fallback = services.settings.defaultVoice(forLocale: locale),
+        if let fallback = services.settings.effectiveDefaultVoice(forLocale: locale),
            let match = installedVoices.first(where: { $0.identifier == fallback }) {
             return "Default (\(match.name))"
         }

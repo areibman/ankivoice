@@ -1,5 +1,4 @@
 import Foundation
-import Speech
 
 /// Dependency container for the application.
 /// Wires the database, repositories, scheduler and settings together.
@@ -63,15 +62,11 @@ final class AppServices {
 }
 
 
-/// Re-runs the speech asset download + capability check on the currently
-/// running engine (if any) and notifies via NotificationCenter so the
-/// session can pick up the new state.
+/// Asks a touch-only session to try voice mode again — typically after the
+/// user came back from enabling Dictation or a permission in Settings. The
+/// session screen restarts with a fresh engine, which re-runs every check.
 extension AppServices {
-    func retryVoiceSetup() async {
-        let locale = Locale(identifier: settings.commandLocale)
-        _ = try? await AssetInventory.reserve(locale: locale)
-        let probe = SpeechTranscriber(locale: locale, preset: .transcription)
-        _ = try? await AssetInventory.assetInstallationRequest(supporting: [probe])?.downloadAndInstall()
+    func retryVoiceSetup() {
         NotificationCenter.default.post(name: .ankivoiceVoiceSetupRetried, object: nil)
     }
 }

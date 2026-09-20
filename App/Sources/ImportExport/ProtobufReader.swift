@@ -92,10 +92,6 @@ struct ProtobufMessage: Sendable {
         varint(number).map { Int(truncatingIfNeeded: $0) }
     }
 
-    func bool(_ number: Int) -> Bool {
-        (varint(number) ?? 0) != 0
-    }
-
     func bytes(_ number: Int) -> Data? {
         for field in fields.reversed() where field.number == number {
             if case .bytes(let d) = field.value { return d }

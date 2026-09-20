@@ -88,8 +88,6 @@ public struct SchedulingState: Codable, Sendable, Hashable {
         self.lapses = lapses
         self.reps = reps
     }
-
-    public var isNew: Bool { kind == .new }
 }
 
 // MARK: - Deck
@@ -102,10 +100,12 @@ public struct Deck: Identifiable, Codable, Sendable, Hashable {
     public var parentID: Int64?
     public var createdAt: Date
     public var modifiedAt: Date
+    public var kind: DeckKind
 
     public init(
         id: Int64, name: String, fullName: String, parentID: Int64?,
-        createdAt: Date = Date(), modifiedAt: Date = Date()
+        createdAt: Date = Date(), modifiedAt: Date = Date(),
+        kind: DeckKind = .normal
     ) {
         self.id = id
         self.name = name
@@ -113,12 +113,28 @@ public struct Deck: Identifiable, Codable, Sendable, Hashable {
         self.parentID = parentID
         self.createdAt = createdAt
         self.modifiedAt = modifiedAt
+        self.kind = kind
     }
 
     public static let nameSeparator = "::"
 }
 
-/// Per-deck study limits.
+/// How a sibling is kept out of the queue. Sibling buries expire at the next
+/// study-day boundary; a user bury stays until it is cleared.
+public enum BuryKind: Int, Codable, Sendable, Hashable {
+    case none = 0
+    case sibling = 1
+    case user = 2
+}
+
+/// Normal decks schedule themselves. Filtered decks are a temporary gathered
+/// set (custom study, cram, review ahead) that returns cards home when done.
+public enum DeckKind: Int, Codable, Sendable, Hashable {
+    case normal = 0
+    case filtered = 1
+}
+
+/// Per-deck study limits and the Anki scheduling options this app honours.
 public struct StudyConfig: Codable, Sendable, Hashable {
     public var newPerDay: Int
     public var reviewsPerDay: Int
@@ -126,17 +142,43 @@ public struct StudyConfig: Codable, Sendable, Hashable {
     public var desiredRetention: Double
     /// Maximum review interval in days.
     public var maximumIntervalDays: Int
+    /// Anki defaults: bury new siblings, do not bury review siblings.
+    public var buryNewSiblings: Bool
+    public var buryReviewSiblings: Bool
+    public var buryInterdayLearning: Bool
+    /// Optimized FSRS-6 weights. Nil uses the collection default, then the
+    /// published defaults.
+    public var parameters: [Double]?
+    /// Monday-first load modifiers. 1 = normal, 0.5 = reduced, 0 = minimum.
+    public var easyDays: [Double]
+    /// Learning steps in seconds. Anki's default is 1 minute, then 10.
+    public var learningSteps: [Double]
+    public var relearningSteps: [Double]
 
     public init(
         newPerDay: Int = 20,
         reviewsPerDay: Int = 200,
         desiredRetention: Double = 0.9,
-        maximumIntervalDays: Int = 36_500
+        maximumIntervalDays: Int = 36_500,
+        buryNewSiblings: Bool = true,
+        buryReviewSiblings: Bool = false,
+        buryInterdayLearning: Bool = true,
+        parameters: [Double]? = nil,
+        easyDays: [Double] = [1, 1, 1, 1, 1, 1, 1],
+        learningSteps: [Double] = [60, 600],
+        relearningSteps: [Double] = [600]
     ) {
         self.newPerDay = newPerDay
         self.reviewsPerDay = reviewsPerDay
         self.desiredRetention = desiredRetention
         self.maximumIntervalDays = maximumIntervalDays
+        self.buryNewSiblings = buryNewSiblings
+        self.buryReviewSiblings = buryReviewSiblings
+        self.buryInterdayLearning = buryInterdayLearning
+        self.parameters = parameters
+        self.easyDays = easyDays.count == 7 ? easyDays : [1, 1, 1, 1, 1, 1, 1]
+        self.learningSteps = learningSteps.isEmpty ? [60, 600] : learningSteps
+        self.relearningSteps = relearningSteps
     }
 }
 
@@ -161,16 +203,15 @@ public struct VoiceConfig: Codable, Sendable, Hashable {
     /// When true the deck follows the global speaking-speed setting and
     /// `speechRate` is ignored.
     public var usesDefaultSpeechRate: Bool
-    /// Endpoint silence after user speech before the turn is considered complete, ms.
-    public var endpointDelayMs: Int
-    public var semanticGradingEnabled: Bool
-    /// Preferred TTS voice quality. Premium voices sound notably more natural
-    /// than the default compact voices.
-    public var preferredQuality: SettingsStore.VoiceQuality
     /// Transient hint set by the session controller before each utterance so
     /// the synthesizer knows whether to use `questionVoice` or `answerVoice`.
     /// Not persisted.
     public var activeSide: SpeechSide?
+    /// The user's per-language voice picks (Settings ▸ Voices), keyed by
+    /// language (`"ja"`). Not stored on the deck. Used when one card side
+    /// mixes languages, so a Japanese word on an English answer still uses
+    /// the Japanese voice instead of the English one.
+    public var languageVoices: [String: String]
 
     public init(
         questionLocale: String = "en-US",
@@ -179,10 +220,8 @@ public struct VoiceConfig: Codable, Sendable, Hashable {
         answerVoice: String? = nil,
         speechRate: Double = 1.0,
         usesDefaultSpeechRate: Bool = true,
-        endpointDelayMs: Int = 700,
-        semanticGradingEnabled: Bool = false,
-        preferredQuality: SettingsStore.VoiceQuality = .auto,
-        activeSide: SpeechSide? = nil
+        activeSide: SpeechSide? = nil,
+        languageVoices: [String: String] = [:]
     ) {
         self.questionLocale = questionLocale
         self.answerLocale = answerLocale
@@ -190,10 +229,8 @@ public struct VoiceConfig: Codable, Sendable, Hashable {
         self.answerVoice = answerVoice
         self.speechRate = speechRate
         self.usesDefaultSpeechRate = usesDefaultSpeechRate
-        self.endpointDelayMs = endpointDelayMs
-        self.semanticGradingEnabled = semanticGradingEnabled
-        self.preferredQuality = preferredQuality
         self.activeSide = activeSide
+        self.languageVoices = languageVoices
     }
 
     /// The explicitly chosen voice for a side (nil = resolve a default).
@@ -241,16 +278,20 @@ public struct NoteType: Identifiable, Codable, Sendable, Hashable {
     public var fieldNames: [String]
     public var templates: [NoteTemplate]
     public var kind: NoteTypeKind
+    /// Anki card CSS. Empty for types created in the app.
+    public var css: String
 
     public init(
         id: Int64, name: String, fieldNames: [String],
-        templates: [NoteTemplate], kind: NoteTypeKind
+        templates: [NoteTemplate], kind: NoteTypeKind,
+        css: String = ""
     ) {
         self.id = id
         self.name = name
         self.fieldNames = fieldNames
         self.templates = templates
         self.kind = kind
+        self.css = css
     }
 
     public static let basic = NoteType(
@@ -329,6 +370,12 @@ public struct Card: Identifiable, Codable, Sendable, Hashable {
     public var templateOrdinal: Int
     public var scheduling: SchedulingState
     public var suspended: Bool
+    public var bury: BuryKind
+    /// When a sibling bury expires. Nil for user buries.
+    public var buriedUntil: Date?
+    /// Home deck while the card sits in a filtered deck.
+    public var originalDeckID: Int64?
+    public var filterPosition: Int?
     public var createdAt: Date
     public var modifiedAt: Date
 
@@ -336,6 +383,10 @@ public struct Card: Identifiable, Codable, Sendable, Hashable {
         id: Int64, noteID: Int64, deckID: Int64, templateOrdinal: Int,
         scheduling: SchedulingState = SchedulingState(),
         suspended: Bool = false,
+        bury: BuryKind = .none,
+        buriedUntil: Date? = nil,
+        originalDeckID: Int64? = nil,
+        filterPosition: Int? = nil,
         createdAt: Date = Date(), modifiedAt: Date = Date()
     ) {
         self.id = id
@@ -344,6 +395,10 @@ public struct Card: Identifiable, Codable, Sendable, Hashable {
         self.templateOrdinal = templateOrdinal
         self.scheduling = scheduling
         self.suspended = suspended
+        self.bury = bury
+        self.buriedUntil = buriedUntil
+        self.originalDeckID = originalDeckID
+        self.filterPosition = filterPosition
         self.createdAt = createdAt
         self.modifiedAt = modifiedAt
     }
@@ -399,30 +454,5 @@ public struct ReviewLog: Identifiable, Codable, Sendable, Hashable {
         self.studyMode = studyMode
         self.previousState = previousState
         self.newState = newState
-    }
-}
-
-// MARK: - Voice compatibility (PRD §24)
-
-public enum VoiceCompatibility: Int, Codable, Sendable, Hashable, Comparable {
-    case excellent = 0
-    case usable = 1
-    case visualRequired = 2
-    case unsupported = 3
-
-    public static func < (lhs: VoiceCompatibility, rhs: VoiceCompatibility) -> Bool {
-        lhs.rawValue < rhs.rawValue
-    }
-
-    /// Cards below this level are skipped in hands-free sessions by default.
-    public static let handsFreeCutoff: VoiceCompatibility = .visualRequired
-
-    public var title: String {
-        switch self {
-        case .excellent: return "Excellent"
-        case .usable: return "Usable"
-        case .visualRequired: return "Visual required"
-        case .unsupported: return "Unsupported"
-        }
     }
 }

@@ -1,120 +1,77 @@
 import XCTest
 @testable import AnkiVoice
 import AVFAudio
+
+/// Automatic voice selection: best installed tier for the language, exact
+/// region preferred within a tier, novelty voices skipped, explicit picks win.
 @MainActor
 final class VoiceQualitySelectionTests: XCTestCase {
 
-    private func config(preferred: SettingsStore.VoiceQuality) -> VoiceConfig {
-        VoiceConfig(
-            questionLocale: "en-US",
-            answerLocale: "en-US",
-            speechRate: 1.0,
-            endpointDelayMs: 700,
-            semanticGradingEnabled: false,
-            preferredQuality: preferred
-        )
+    private func config() -> VoiceConfig {
+        VoiceConfig(questionLocale: "en-US", answerLocale: "en-US", speechRate: 1.0)
     }
 
-    /// Premium requested, premium voice available → must pick the premium voice
-    /// for the exact locale. This is the case the user expected to hear
-    /// (Ava Premium / Samantha Premium etc.).
-    func testPremiumPreferencePicksPremiumVoice() {
-        let catalog = InMemoryVoiceCatalog(voices: [
+    private func makeTTS(_ voices: [VoiceCatalogVoice]) -> TextToSpeech {
+        let tts = TextToSpeech()
+        tts.catalog = InMemoryVoiceCatalog(voices: voices)
+        return tts
+    }
+
+    func testPicksPremiumOverEnhancedOverCompact() {
+        let tts = makeTTS([
             VoiceCatalogVoice(identifier: "en-US-compact", name: "Compact", language: "en-US", quality: .compact),
             VoiceCatalogVoice(identifier: "en-US-enhanced", name: "Samantha", language: "en-US", quality: .enhanced),
             VoiceCatalogVoice(identifier: "en-US-premium", name: "Ava", language: "en-US", quality: .premium),
         ])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        let id = tts.selectVoice(locale: "en-US", config: config(preferred: .premium))
-        XCTAssertEqual(id, "en-US-premium", "Premium preference must select premium voice, not compact or enhanced")
+        XCTAssertEqual(tts.selectVoice(locale: "en-US", config: config()), "en-US-premium")
     }
 
-    /// Premium requested but no premium voice installed for this locale →
-    /// fall back to enhanced, NOT compact. (Compact sounds bad — the
-    /// original user complaint.)
-    func testPremiumPreferenceFallsBackToEnhancedNotCompact() {
-        let catalog = InMemoryVoiceCatalog(voices: [
+    /// The robotic compact voice is only ever used when nothing better is installed.
+    func testEnhancedBeatsCompact() {
+        let tts = makeTTS([
             VoiceCatalogVoice(identifier: "en-US-compact", name: "Compact", language: "en-US", quality: .compact),
             VoiceCatalogVoice(identifier: "en-US-enhanced", name: "Samantha", language: "en-US", quality: .enhanced),
         ])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        let id = tts.selectVoice(locale: "en-US", config: config(preferred: .premium))
-        XCTAssertEqual(id, "en-US-enhanced", "When premium unavailable, must use enhanced — never compact")
+        XCTAssertEqual(tts.selectVoice(locale: "en-US", config: config()), "en-US-enhanced")
     }
 
-    /// Premium requested but only compact exists (the worst case) →
-    /// compact is the only choice but the user should be warned.
-    func testPremiumPreferenceWithOnlyCompactFallsBack() {
-        let catalog = InMemoryVoiceCatalog(voices: [
-            VoiceCatalogVoice(identifier: "en-US-compact", name: "Compact", language: "en-US", quality: .compact),
-        ])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        let id = tts.selectVoice(locale: "en-US", config: config(preferred: .premium))
-        XCTAssertEqual(id, "en-US-compact", "Compact is the only option, fall back to it")
+    func testCompactIsUsedWhenItIsTheOnlyVoiceForTheLanguage() {
+        let tts = makeTTS([VoiceCatalogVoice(identifier: "ja-JP-compact", language: "ja-JP", quality: .compact)])
+        XCTAssertEqual(tts.selectVoice(locale: "ja-JP", config: config()), "ja-JP-compact")
     }
 
-    /// Auto preference prefers premium when present, then enhanced, then compact.
-    func testAutoPreferencePicksHighestAvailable() {
-        let catalog = InMemoryVoiceCatalog(voices: [
+    /// An explicit voice always wins over Automatic, whatever its quality.
+    func testExplicitUserSelectionOverridesAutomatic() {
+        let tts = makeTTS([
             VoiceCatalogVoice(identifier: "en-US-compact", language: "en-US", quality: .compact),
             VoiceCatalogVoice(identifier: "en-US-premium", language: "en-US", quality: .premium),
         ])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        let id = tts.selectVoice(locale: "en-US", config: config(preferred: .auto))
-        XCTAssertEqual(id, "en-US-premium", "Auto should always pick premium when available")
+        var cfg = config()
+        cfg.questionVoice = "en-US-compact"
+        XCTAssertEqual(tts.selectVoice(locale: "en-US", config: cfg), "en-US-compact")
     }
 
-    /// The user's exact scenario: the device only has compact voices installed
-    /// for the language. Premium + enhanced preferences must still produce a
-    /// usable voice (compact in this case) — but at least the locale matches
-    /// and we don't fall back to a wrong language entirely.
-    func testOnlyCompactVoiceForLanguageIsStillUsable() {
-        let catalog = InMemoryVoiceCatalog(voices: [
-            VoiceCatalogVoice(identifier: "ja-JP-compact", language: "ja-JP", quality: .compact),
-        ])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        let id = tts.selectVoice(locale: "ja-JP", config: config(preferred: .premium))
-        XCTAssertEqual(id, "ja-JP-compact", "When only compact is available for the language, use it")
-    }
-
-    /// User-selected voice (explicit identifier) overrides the quality preference.
-    func testExplicitUserSelectionOverridesQualityPreference() {
-        let catalog = InMemoryVoiceCatalog(voices: [
-            VoiceCatalogVoice(identifier: "en-US-compact", language: "en-US", quality: .compact),
-            VoiceCatalogVoice(identifier: "en-US-premium", language: "en-US", quality: .premium),
-        ])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        var cfg = config(preferred: .enhanced)
-        cfg.questionVoice = "en-US-compact"  // user picked compact explicitly
-        let id = tts.selectVoice(locale: "en-US", config: cfg)
-        XCTAssertEqual(id, "en-US-compact", "Explicit user voice selection must always win")
-    }
-
-    /// Locale tag mismatch: user wants Japanese, but only US English voices exist.
-    /// We should still pick US English (better than failing).
+    /// Locale mismatch: Japanese requested, only US English installed → still
+    /// pick English rather than failing.
     func testFallsBackToLanguageMatchWhenLocaleMissing() {
-        let catalog = InMemoryVoiceCatalog(voices: [
-            VoiceCatalogVoice(identifier: "en-US-premium", language: "en-US", quality: .premium),
-        ])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        let id = tts.selectVoice(locale: "ja-JP", config: config(preferred: .premium))
-        XCTAssertEqual(id, "en-US-premium", "Should fall back to language match rather than failing")
+        let tts = makeTTS([VoiceCatalogVoice(identifier: "en-US-premium", language: "en-US", quality: .premium)])
+        XCTAssertEqual(tts.selectVoice(locale: "ja-JP", config: config()), "en-US-premium")
     }
 
-    /// Empty catalog (no voices for this language at all) → nil.
     func testEmptyCatalogReturnsNil() {
-        let catalog = InMemoryVoiceCatalog(voices: [])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        let id = tts.selectVoice(locale: "en-US", config: config(preferred: .auto))
-        XCTAssertNil(id)
+        XCTAssertNil(makeTTS([]).selectVoice(locale: "en-US", config: config()))
+    }
+
+    /// Voice catalog filtering is by language prefix, so en-GB serves en-US.
+    func testCatalogLanguagePrefixFiltering() {
+        let catalog = InMemoryVoiceCatalog(voices: [
+            VoiceCatalogVoice(identifier: "en-US", name: "Samantha", language: "en-US", quality: .enhanced),
+            VoiceCatalogVoice(identifier: "en-GB", name: "Daniel", language: "en-GB", quality: .compact),
+            VoiceCatalogVoice(identifier: "fr-FR", name: "Amelie", language: "fr-FR", quality: .compact),
+        ])
+        let enVoices = catalog.voices(matching: "en")
+        XCTAssertEqual(enVoices.count, 2)
+        XCTAssertTrue(enVoices.allSatisfy { $0.language.hasPrefix("en") })
     }
 
     // MARK: - Regressions behind "the weird default voice"
@@ -122,27 +79,22 @@ final class VoiceQualitySelectionTests: XCTestCase {
     /// iOS lists the en-US novelty voices (Albert, Bad News, Bubbles…) before
     /// Samantha. Auto-selection must skip them.
     func testNoveltyVoicesAreNeverAutoSelected() {
-        let catalog = InMemoryVoiceCatalog(voices: [
+        let tts = makeTTS([
             VoiceCatalogVoice(identifier: "com.apple.speech.synthesis.voice.Albert", name: "Albert", language: "en-US", quality: .compact, isNovelty: true),
             VoiceCatalogVoice(identifier: "com.apple.speech.synthesis.voice.BadNews", name: "Bad News", language: "en-US", quality: .compact, isNovelty: true),
             VoiceCatalogVoice(identifier: "com.apple.eloquence.en-US.Grandma", name: "Grandma", language: "en-US", quality: .compact, isNovelty: true),
             VoiceCatalogVoice(identifier: "com.apple.voice.compact.en-US.Samantha", name: "Samantha", language: "en-US", quality: .compact),
         ])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        let id = tts.selectVoice(locale: "en-US", config: config(preferred: .auto))
-        XCTAssertEqual(id, "com.apple.voice.compact.en-US.Samantha")
+        XCTAssertEqual(tts.selectVoice(locale: "en-US", config: config()), "com.apple.voice.compact.en-US.Samantha")
     }
 
     /// A novelty voice the user explicitly chose is still honored.
     func testExplicitNoveltyVoiceIsHonored() {
-        let catalog = InMemoryVoiceCatalog(voices: [
+        let tts = makeTTS([
             VoiceCatalogVoice(identifier: "novelty", name: "Zarvox", language: "en-US", quality: .compact, isNovelty: true),
             VoiceCatalogVoice(identifier: "samantha", name: "Samantha", language: "en-US", quality: .compact),
         ])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        var cfg = config(preferred: .auto)
+        var cfg = config()
         cfg.questionVoice = "novelty"
         XCTAssertEqual(tts.selectVoice(locale: "en-US", config: cfg.speaking(.question)), "novelty")
     }
@@ -150,56 +102,63 @@ final class VoiceQualitySelectionTests: XCTestCase {
     /// A premium voice in another language must never read this language:
     /// a compact English voice beats a premium Japanese one for English text.
     func testLanguageMatchBeatsQualityInOtherLanguage() {
-        let catalog = InMemoryVoiceCatalog(voices: [
+        let tts = makeTTS([
             VoiceCatalogVoice(identifier: "ja-premium", name: "Kyoko", language: "ja-JP", quality: .premium),
             VoiceCatalogVoice(identifier: "en-compact", name: "Samantha", language: "en-US", quality: .compact),
         ])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        XCTAssertEqual(tts.selectVoice(locale: "en-US", config: config(preferred: .auto)), "en-compact")
-        XCTAssertEqual(tts.selectVoice(locale: "ja-JP", config: config(preferred: .auto)), "ja-premium")
+        XCTAssertEqual(tts.selectVoice(locale: "en-US", config: config()), "en-compact")
+        XCTAssertEqual(tts.selectVoice(locale: "ja-JP", config: config()), "ja-premium")
     }
 
     /// Within a language, the exact regional variant wins inside a tier but a
     /// higher tier from another region still wins overall.
     func testExactRegionPreferredWithinTier() {
-        let catalog = InMemoryVoiceCatalog(voices: [
+        let all = [
             VoiceCatalogVoice(identifier: "en-GB-compact", language: "en-GB", quality: .compact),
             VoiceCatalogVoice(identifier: "en-US-compact", language: "en-US", quality: .compact),
             VoiceCatalogVoice(identifier: "en-AU-enhanced", language: "en-AU", quality: .enhanced),
-        ])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        XCTAssertEqual(tts.selectVoice(locale: "en-US", config: config(preferred: .auto)), "en-AU-enhanced")
-        let compactOnly = InMemoryVoiceCatalog(voices: Array(catalog.voices.prefix(2)))
-        tts.catalog = compactOnly
-        XCTAssertEqual(tts.selectVoice(locale: "en-US", config: config(preferred: .auto)), "en-US-compact")
+        ]
+        let tts = makeTTS(all)
+        XCTAssertEqual(tts.selectVoice(locale: "en-US", config: config()), "en-AU-enhanced")
+        tts.catalog = InMemoryVoiceCatalog(voices: Array(all.prefix(2)))
+        XCTAssertEqual(tts.selectVoice(locale: "en-US", config: config()), "en-US-compact")
     }
 
     /// Question and answer share a locale but use different voices: the side
     /// being spoken decides, not the locale.
     func testAnswerVoiceUsedWhenLocalesMatch() {
-        let catalog = InMemoryVoiceCatalog(voices: [
+        let tts = makeTTS([
             VoiceCatalogVoice(identifier: "ava", name: "Ava", language: "en-US", quality: .premium),
             VoiceCatalogVoice(identifier: "tom", name: "Tom", language: "en-US", quality: .enhanced),
         ])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        var cfg = config(preferred: .auto)
+        var cfg = config()
         cfg.questionVoice = "ava"
         cfg.answerVoice = "tom"
         XCTAssertEqual(tts.selectVoice(locale: "en-US", config: cfg.speaking(.question)), "ava")
         XCTAssertEqual(tts.selectVoice(locale: "en-US", config: cfg.speaking(.answer)), "tom")
     }
 
-    /// An explicit voice that isn't installed any more falls back to auto.
-    func testMissingExplicitVoiceFallsBackToAuto() {
-        let catalog = InMemoryVoiceCatalog(voices: [
-            VoiceCatalogVoice(identifier: "samantha", language: "en-US", quality: .enhanced),
+    /// The voice chosen for a side stays when the text is another language.
+    /// Foreign decks used to hop to a new speaker for every detected script.
+    func testExplicitVoiceStaysWhenTheChunkLanguageDiffers() {
+        let tts = makeTTS([
+            VoiceCatalogVoice(identifier: "ja-JP-compact", name: "Kyoko", language: "ja-JP", quality: .compact),
+            VoiceCatalogVoice(identifier: "en-US-premium", name: "Ava", language: "en-US", quality: .premium),
+            VoiceCatalogVoice(identifier: "supertonic3:F1", name: "Female 1", language: "en-US", quality: .premium, kind: .supertonic3),
         ])
-        let tts = TextToSpeech()
-        tts.catalog = catalog
-        var cfg = config(preferred: .auto)
+        var cfg = VoiceConfig(questionLocale: "ja-JP", answerLocale: "en-US", speechRate: 1)
+        cfg.questionVoice = "ja-JP-compact"
+        cfg.answerVoice = "en-US-premium"
+        cfg.languageVoices = ["en": "en-US-premium", "ja": "supertonic3:F1"]
+        XCTAssertEqual(tts.selectVoice(locale: "en-US", config: cfg.speaking(.question)), "ja-JP-compact")
+        XCTAssertEqual(tts.selectVoice(locale: "ja-JP", config: cfg.speaking(.question)), "ja-JP-compact")
+        XCTAssertEqual(tts.selectVoice(locale: "ja-JP", config: cfg.speaking(.answer)), "en-US-premium")
+    }
+
+    /// An explicit voice that isn't installed any more falls back to Automatic.
+    func testMissingExplicitVoiceFallsBackToAutomatic() {
+        let tts = makeTTS([VoiceCatalogVoice(identifier: "samantha", language: "en-US", quality: .enhanced)])
+        var cfg = config()
         cfg.questionVoice = "deleted-voice"
         XCTAssertEqual(tts.selectVoice(locale: "en-US", config: cfg.speaking(.question)), "samantha")
     }
@@ -212,6 +171,7 @@ final class VoiceQualitySelectionTests: XCTestCase {
         XCTAssertEqual(settings.defaultVoice(forLocale: "en-GB"), "ava")
         XCTAssertEqual(settings.defaultVoice(forLocale: "en"), "ava")
         XCTAssertNil(settings.defaultVoice(forLocale: "ja-JP"))
+        XCTAssertNil(settings.effectiveDefaultVoice(forLocale: "ja-JP"))
         settings.setDefaultVoice(nil, forLocale: "en-AU")
         XCTAssertNil(settings.defaultVoice(forLocale: "en-US"))
     }
@@ -224,5 +184,64 @@ final class VoiceQualitySelectionTests: XCTestCase {
         XCTAssertEqual(settings.speechRate, 2.0)
         settings.speechRate = 0.1
         XCTAssertEqual(settings.speechRate, 0.5)
+    }
+
+    // MARK: - Supertonic 3
+
+    func testSupertonicVoicesAreNeverAutoSelected() {
+        let tts = makeTTS([
+            VoiceCatalogVoice(identifier: "samantha", name: "Samantha", language: "en-US", quality: .compact),
+            VoiceCatalogVoice(identifier: "supertonic3:F1", name: "Female 1", language: "en-US", quality: .premium, kind: .supertonic3),
+        ])
+        XCTAssertEqual(tts.selectVoice(locale: "en-US", config: config()), "samantha")
+    }
+
+    /// Picking Female 1 for English keeps her when a side is switched to
+    /// Japanese and that language has no voice of its own.
+    func testSupertonicChoiceCarriesToALanguageWithoutAPick() {
+        let tts = makeTTS([
+            VoiceCatalogVoice(identifier: "ja-JP-compact", name: "Kyoko", language: "ja-JP", quality: .compact),
+            VoiceCatalogVoice(identifier: "supertonic3:F1", name: "Female 1", language: "en-US", quality: .premium, kind: .supertonic3),
+        ])
+        var cfg = VoiceConfig(questionLocale: "ja-JP", answerLocale: "en-US", speechRate: 1)
+        cfg.languageVoices = ["en": "supertonic3:F1"]
+        XCTAssertEqual(tts.selectVoice(locale: "ja-JP", config: cfg.speaking(.question)), "supertonic3:F1")
+
+        let defaults = UserDefaults(suiteName: "VoiceCarry-\(UUID().uuidString)")!
+        let settings = SettingsStore(defaults: defaults)
+        settings.setDefaultVoice("supertonic3:F1", forLocale: "en-US")
+        XCTAssertEqual(settings.effectiveDefaultVoice(forLocale: "ja-JP"), "supertonic3:F1")
+        settings.setDefaultVoice("ja-JP-compact", forLocale: "ja-JP")
+        XCTAssertEqual(settings.effectiveDefaultVoice(forLocale: "ja-JP"), "ja-JP-compact")
+    }
+
+    func testExplicitSupertonicVoiceIsHonored() {
+        let tts = makeTTS([
+            VoiceCatalogVoice(identifier: "samantha", language: "en-US", quality: .compact),
+            VoiceCatalogVoice(identifier: "supertonic3:M1", name: "Male 1", language: "en-US", quality: .premium, kind: .supertonic3),
+        ])
+        var cfg = config()
+        cfg.questionVoice = "supertonic3:M1"
+        XCTAssertEqual(tts.selectVoice(locale: "en-US", config: cfg.speaking(.question)), "supertonic3:M1")
+    }
+
+    func testSupertonicCatalogCoversSupportedLanguagesOnly() {
+        let english = SupertonicVoiceCatalog.voices(matching: "en")
+        XCTAssertEqual(english.count, 10)
+        XCTAssertTrue(english.allSatisfy { $0.kind == .supertonic3 && $0.languageKey == "en" && !$0.isAutoEligible })
+        XCTAssertEqual(SupertonicVoiceCatalog.voices(matching: "zh").count, 10)
+        XCTAssertTrue(SupertonicVoiceCatalog.supports(languageKey: "ja"))
+        XCTAssertFalse(SupertonicVoiceCatalog.supports(languageKey: "zh"))
+        XCTAssertEqual(SupertonicVoiceCatalog.synthesisLanguage(for: "ja-JP"), "ja")
+        XCTAssertEqual(SupertonicVoiceCatalog.synthesisLanguage(for: "zh-CN"), "na")
+        XCTAssertEqual(SupertonicVoiceCatalog.presetID(from: "supertonic3:F3"), "F3")
+        XCTAssertNil(SupertonicVoiceCatalog.presetID(from: "com.apple.voice.compact.en-US.Samantha"))
+    }
+
+    func testWavHeaderIs44BytesPlusPCM() {
+        let samples: [Float] = [0, 0.5, -0.5, 1]
+        let data = PCMWav.data(samples: samples, sampleRate: 44_100)
+        XCTAssertEqual(data.count, 44 + samples.count * 2)
+        XCTAssertEqual(String(data: data.prefix(4), encoding: .ascii), "RIFF")
     }
 }

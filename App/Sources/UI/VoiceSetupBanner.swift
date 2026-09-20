@@ -27,7 +27,7 @@ struct VoiceSetupBanner: View {
                 .accessibilityIdentifier("session.fixVoice")
 
                 Button {
-                    Task { await services.retryVoiceSetup() }
+                    services.retryVoiceSetup()
                 } label: {
                     Label("Retry", systemImage: "arrow.clockwise")
                         .frame(maxWidth: .infinity)

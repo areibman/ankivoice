@@ -31,6 +31,10 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
     private var speechRecognizer: SFSpeechRecognizer?
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
+    /// Feeds captured audio to the current request. Capture runs for the whole
+    /// session; this is what gets detached to go half-duplex while speaking.
+    private let sink = AudioTapSink()
+    private var tapInstalled = false
 
     /// Bumped on every start/stop; callbacks from an older generation are ignored.
     private var generation = 0
@@ -91,9 +95,20 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
         guard let sfRecognizer = SFSpeechRecognizer(locale: Locale(identifier: self.commandLocale)) else {
             throw VoiceEngineError.localeUnsupported(self.commandLocale)
         }
+        // Audio never leaves the device: recognition runs on the dictation
+        // model iOS installs for the locale, or not at all.
+        guard sfRecognizer.supportsOnDeviceRecognition else {
+            throw VoiceEngineError.onDeviceUnavailable(self.commandLocale)
+        }
         sfRecognizer.defaultTaskHint = .dictation
         speechRecognizer = sfRecognizer
-        speechLog.info("[VOICE] prepare() complete onDevice=\(sfRecognizer.supportsOnDeviceRecognition)")
+
+        // Open the microphone now, while the app is certain to be in the
+        // foreground, and leave it open for the session. A first cold start
+        // from the background — the user locks the screen during the opening
+        // question — is the one the system is most likely to refuse.
+        try? await startAudioCapture()
+        speechLog.info("[VOICE] prepare() complete, on-device recognition ready")
     }
 
     public func speak(_ segments: [SpeechRenderer.Segment], voice: VoiceConfig) async {
@@ -128,6 +143,7 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
 
     public func shutdown() {
         stopRecognition()
+        stopAudioCapture()
         if let configurationObserver {
             NotificationCenter.default.removeObserver(configurationObserver)
             self.configurationObserver = nil
@@ -161,49 +177,11 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
         request.shouldReportPartialResults = true
         request.taskHint = phase == .awaitingAnswer ? .dictation : .search
         request.contextualStrings = Self.contextualStrings(for: phase)
-        // Cloud fallback keeps recognition working when on-device assets are
-        // missing; on-device is used automatically when available.
-        request.requiresOnDeviceRecognition = false
+        request.requiresOnDeviceRecognition = true
         request.addsPunctuation = false
         self.request = request
 
-        // The session may have been deactivated by an interruption (call,
-        // Siri); re-asserting it is idempotent.
-        try? AVAudioSession.sharedInstance().setActive(true)
-
-        let inputNode = audioEngine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw VoiceEngineError.notPrepared
-        }
-        // The tap runs on the audio thread; the request is only ever appended
-        // to there and ended on the main actor, which SFSpeech permits.
-        nonisolated(unsafe) let tapRequest = request
-        // AVAudioEngine raises Objective-C exceptions for a tap whose format
-        // no longer matches the hardware (AirPods switching profiles mid-
-        // session is the classic case). Catch them so the session degrades
-        // to an error message instead of crashing.
-        do {
-            var startError: Error?
-            try ObjCException.catching {
-                inputNode.removeTap(onBus: 0)
-                // `@Sendable`: the tap block runs on the audio render thread,
-                // so it must not inherit main-actor isolation (see
-                // ensureSpeechAuthorization for the crash that causes).
-                inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { @Sendable buffer, _ in
-                    tapRequest.append(buffer)
-                }
-                audioEngine.prepare()
-                do { try audioEngine.start() } catch { startError = error }
-            }
-            if let startError { throw startError }
-        } catch {
-            speechLog.error("[VOICE] audio engine start failed: \(error.localizedDescription, privacy: .public)")
-            try? ObjCException.catching { inputNode.removeTap(onBus: 0) }
-            audioEngine.reset()
-            throw error
-        }
-        observeConfigurationChanges()
+        try await startAudioCapture()
 
         listening = true
         task = sfRecognizer.recognitionTask(with: request) { @Sendable [weak self] result, error in
@@ -219,25 +197,104 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
             }
         }
 
+        // Buffers only start reaching the recognizer once the task exists, so
+        // nothing captured while the app was speaking leaks into this window.
+        sink.attach(request)
         startSilenceWatchdog(generation: gen)
         speechLog.info("[VOICE] listening phase=\(String(describing: self.phase), privacy: .public) gen=\(gen)")
     }
 
+    /// Ends the current recognition window but leaves the microphone running.
+    ///
+    /// Capture deliberately outlives the window: tearing the audio engine down
+    /// between every question, answer and rating is what broke hands-free use
+    /// with the screen locked. The `audio` background mode only keeps the app
+    /// alive while audio is actually flowing, so each silent gap was a chance
+    /// for iOS to suspend the process — and restarting capture from the
+    /// background is frequently refused outright. Detaching the sink is enough
+    /// to stay half-duplex: buffers keep arriving and are dropped on the floor.
     private func stopRecognition() {
         generation += 1
         listening = false
         silenceTask?.cancel()
         silenceTask = nil
-        if audioEngine.isRunning {
-            try? ObjCException.catching {
-                audioEngine.inputNode.removeTap(onBus: 0)
-                audioEngine.stop()
-            }
-        }
+        sink.attach(nil)
         request?.endAudio()
         request = nil
         task?.cancel()
         task = nil
+    }
+
+    // MARK: - Microphone capture
+
+    /// Starts continuous capture, or returns immediately when it's already
+    /// running. Safe to call on every listening window.
+    private func startAudioCapture() async throws {
+        if audioEngine.isRunning, tapInstalled { return }
+
+        var lastError: Error?
+        for attempt in 0..<4 {
+            if attempt > 0 {
+                try? await Task.sleep(for: .milliseconds(150 * attempt))
+            }
+            // The session may have been deactivated by an interruption (call,
+            // Siri) or refused while the screen was locking.
+            let controller = audioSessionController ?? AudioSessionController.shared
+            audioSessionController = controller
+            await controller.activateForRecording()
+            do {
+                try installTapAndStart()
+                observeConfigurationChanges()
+                speechLog.info("[VOICE] microphone capture running (attempt \(attempt + 1))")
+                return
+            } catch {
+                lastError = error
+                speechLog.error(
+                    "[VOICE] capture start failed: \(error.localizedDescription, privacy: .public)"
+                )
+                stopAudioCapture()
+            }
+        }
+        throw lastError ?? VoiceEngineError.notPrepared
+    }
+
+    private func installTapAndStart() throws {
+        let inputNode = audioEngine.inputNode
+        let format = inputNode.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            throw VoiceEngineError.notPrepared
+        }
+        // The tap runs on the audio render thread and must not inherit
+        // main-actor isolation (see ensureSpeechAuthorization for the crash
+        // that causes), so it talks to the lock-protected sink instead of
+        // touching engine state.
+        let sink = self.sink
+        // AVAudioEngine raises Objective-C exceptions for a tap whose format
+        // no longer matches the hardware (AirPods switching profiles mid-
+        // session is the classic case). Catch them so the session degrades
+        // to an error message instead of crashing.
+        var startError: Error?
+        try ObjCException.catching {
+            inputNode.removeTap(onBus: 0)
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { @Sendable buffer, _ in
+                sink.append(buffer)
+            }
+            audioEngine.prepare()
+            do { try audioEngine.start() } catch { startError = error }
+        }
+        if let startError { throw startError }
+        tapInstalled = true
+    }
+
+    private func stopAudioCapture() {
+        sink.attach(nil)
+        guard tapInstalled || audioEngine.isRunning else { return }
+        try? ObjCException.catching {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            audioEngine.stop()
+        }
+        audioEngine.reset()
+        tapInstalled = false
     }
 
     // MARK: - Audio configuration changes
@@ -262,9 +319,31 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
     }
 
     private func handleConfigurationChange() {
+        // The engine stops itself on a hardware format change, so capture has
+        // to be rebuilt even when no recognition window is open — otherwise
+        // the next one starts against a dead engine.
+        stopAudioCapture()
         guard listening else { return }
         speechLog.info("[VOICE] audio configuration changed; reinstalling tap")
         restartRecognition(reason: "configuration change")
+    }
+
+    /// Capture died underneath an open listening window. Rebuild it a bounded
+    /// number of times before handing the user an error, so a wedged input
+    /// device can't spin the session.
+    private func recoverFromLostCapture() {
+        guard listening else { return }
+        guard restartCount < 5 else {
+            speechLog.error("[VOICE] microphone did not come back; giving up")
+            listening = false
+            stopRecognition()
+            stopAudioCapture()
+            continuation.yield(.failure("The microphone stopped responding. Tap Resume to try again."))
+            return
+        }
+        restartCount += 1
+        stopAudioCapture()
+        restartRecognition(reason: "microphone stopped")
     }
 
     /// Restarts recognition in the same phase after the recognizer closed the
@@ -410,6 +489,13 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(80))
                 guard let self, self.generation == gen, self.listening else { return }
+                // Capture can die without a notification — the system clawing
+                // back the input while locked, say — which would otherwise
+                // leave the window open and deaf forever.
+                guard self.audioEngine.isRunning else {
+                    self.recoverFromLostCapture()
+                    return
+                }
                 guard let last = self.lastSpeechAt else { continue }
                 if Date().timeIntervalSince(last) >= endpoint {
                     self.endUtterance(reason: "silence")
@@ -423,10 +509,7 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
 
     private func ensureSpeaker() -> TextToSpeech {
         if let tts { return tts }
-        let speaker = TextToSpeech()
-        if let media = try? AppServices.mediaDirectory() {
-            speaker.setMediaDirectory(media)
-        }
+        let speaker = TextToSpeech(mediaDirectory: try? AppServices.mediaDirectory())
         tts = speaker
         return speaker
     }
@@ -512,6 +595,42 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
     }
 }
 
+// MARK: - Audio tap sink
+
+/// Bridge between the audio render thread and the recognition window.
+///
+/// The microphone tap runs continuously for the whole session, so the request
+/// it feeds has to be swappable from the main actor while buffers are in
+/// flight: a fresh request per listening window, and nil while the app is
+/// speaking. The lock is held only long enough to read the reference — never
+/// across `append`, which must not block the render thread.
+final class AudioTapSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    /// Buffers dropped because no window was open. Test/diagnostic only.
+    private(set) var droppedBuffers = 0
+
+    func attach(_ request: SFSpeechAudioBufferRecognitionRequest?) {
+        lock.lock()
+        self.request = request
+        lock.unlock()
+    }
+
+    func append(_ buffer: AVAudioPCMBuffer) {
+        lock.lock()
+        let target = request
+        if target == nil { droppedBuffers += 1 }
+        lock.unlock()
+        target?.append(buffer)
+    }
+
+    var isAttached: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return request != nil
+    }
+}
+
 // MARK: - Errors
 
 enum VoiceEngineError: LocalizedError {
@@ -520,19 +639,22 @@ enum VoiceEngineError: LocalizedError {
     case speechDenied
     case microphoneDenied
     case localeUnsupported(String)
+    case onDeviceUnavailable(String)
 
     var errorDescription: String? {
         switch self {
         case .notPrepared:
             return "The microphone isn't ready. Check that no other app is using it."
         case .speechUnavailable:
-            return "Speech recognition isn't available right now. Enable Dictation in Settings → General → Keyboard, or connect to the internet."
+            return "Speech recognition isn't available right now. Enable Dictation in Settings → General → Keyboard and try again."
         case .speechDenied:
             return "Speech recognition is turned off for AnkiVoice. Allow it in Settings → Privacy & Security → Speech Recognition."
         case .microphoneDenied:
             return "Microphone access is turned off for AnkiVoice. Allow it in Settings → Privacy & Security → Microphone."
         case .localeUnsupported(let locale):
             return "Speech recognition for \(locale) is not supported on this device."
+        case .onDeviceUnavailable(let locale):
+            return "The on-device speech model for \(locale) isn't installed. Turn on Dictation in Settings → General → Keyboard so iOS downloads it; AnkiVoice never sends audio off the device."
         }
     }
 
@@ -550,7 +672,7 @@ enum RecognitionErrorClassifier {
     static func message(for error: NSError, locale: String) -> String {
         switch error.code {
         case 11_103, -1_9241:
-            return "Voice recognition is not ready (\(locale)). Enable Dictation in Settings → General → Keyboard → Dictation, or connect to Wi-Fi and try again."
+            return "Voice recognition is not ready (\(locale)). Enable Dictation in Settings → General → Keyboard → Dictation so iOS installs the on-device model, then try again."
         case 11_100:
             return "Voice recognition is not available on this device."
         case 11_101, 1101:
@@ -560,7 +682,7 @@ enum RecognitionErrorClassifier {
         case 1110:
             return "Voice recognition didn't hear anything. Tap Reveal or speak again."
         case 203, 1107, 1700:
-            return "Voice recognition lost its connection. Check your internet connection or enable on-device dictation for \(locale)."
+            return "Voice recognition stopped unexpectedly. Make sure Dictation is enabled for \(locale) in Settings → General → Keyboard, then try again."
         default:
             return "Voice recognition failed: \(error.localizedDescription)"
         }

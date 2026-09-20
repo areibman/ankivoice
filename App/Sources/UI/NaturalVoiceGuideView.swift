@@ -11,9 +11,6 @@ import SwiftUI
 struct NaturalVoiceGuideView: View {
     /// BCP-47 locale the guide is about, e.g. "en-US".
     let locale: String
-    /// Whether to offer a link into the voice list. Off when the guide is
-    /// opened *from* that list.
-    var showsVoiceList = true
 
     @Environment(AppServices.self) private var services
     @Environment(\.dismiss) private var dismiss
@@ -26,10 +23,6 @@ struct NaturalVoiceGuideView: View {
                     statusCard
                     steps
                     siriNote
-                    recommendations
-                    if showsVoiceList {
-                        voiceListLink
-                    }
                 }
                 .padding()
                 .padding(.bottom, 24)
@@ -97,25 +90,46 @@ struct NaturalVoiceGuideView: View {
                 .accessibilityIdentifier("guide.useBetter")
             }
         } else if let voice = status.voice {
-            switch voice.quality {
-            case .premium:
+            if voice.kind == .supertonic3 {
                 card(
                     tint: .green, icon: "checkmark.seal.fill",
                     title: "\(voice.name) is ready",
-                    body: "A Premium \(languageName) voice is installed and will read your cards. Nothing else to do."
+                    body: "Supertonic 3 will read \(languageName) cards on this iPhone. The model downloads once, then everything stays on device."
                 )
-            case .enhanced:
-                card(
-                    tint: .green, icon: "checkmark.circle.fill",
-                    title: "\(voice.name) is ready",
-                    body: "An Enhanced \(languageName) voice is installed. A Premium voice sounds even more natural if you'd like to go further."
-                )
-            case .compact:
-                card(
-                    tint: .orange, icon: "waveform.badge.exclamationmark",
-                    title: "Only the built-in voice is installed",
-                    body: "\(languageName) cards are currently read by \(voice.name), the basic iOS voice. Natural voices are a free download — follow the steps below."
-                )
+            } else {
+                switch voice.quality {
+                case .premium:
+                    card(
+                        tint: .green, icon: "checkmark.seal.fill",
+                        title: "\(voice.name) is ready",
+                        body: "A Premium \(languageName) voice is installed and will read your cards. Nothing else to do."
+                    )
+                case .enhanced:
+                    card(
+                        tint: .green, icon: "checkmark.circle.fill",
+                        title: "\(voice.name) is ready",
+                        body: "An Enhanced \(languageName) voice is installed. A Premium voice sounds even more natural if you'd like to go further."
+                    )
+                case .compact:
+                    card(
+                        tint: .orange, icon: "waveform.badge.exclamationmark",
+                        title: "Only the built-in voice is installed",
+                        body: "\(languageName) cards are currently read by \(voice.name), the basic iOS voice. Natural iOS voices are a free download — follow the steps below. You can also pick a Supertonic 3 voice in Voices."
+                    ) {
+                        Button {
+                            services.settings.setDefaultVoice(
+                                SupertonicVoiceCatalog.identifier(for: "F1"),
+                                forLocale: locale
+                            )
+                        } label: {
+                            Label("Use Supertonic 3", systemImage: "waveform")
+                                .font(.headline)
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier("guide.useSupertonic")
+                    }
+                }
             }
         } else {
             card(
@@ -188,73 +202,5 @@ struct NaturalVoiceGuideView: View {
         }
         .padding(14)
         .background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-
-    @ViewBuilder
-    private var recommendations: some View {
-        let names = NaturalVoiceGuideView.recommendedVoices(forLanguage: languageKey)
-        if !names.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Good \(languageName) picks")
-                    .font(.headline)
-                Text(names.joined(separator: " · "))
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                Text("All Premium, all free.")
-                    .font(.caption)
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        }
-    }
-
-    /// Straight to the picker for people who just want to choose among
-    /// what's already installed.
-    private var voiceListLink: some View {
-        NavigationLink {
-            VoicePickerView(initialLocale: locale)
-        } label: {
-            HStack(spacing: 12) {
-                Image(systemName: "person.wave.2")
-                    .foregroundStyle(Color.accentColor)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Choose from installed voices")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
-                    Text("\(inventory.voices(forLanguage: languageKey).filter { !$0.isNovelty }.count) \(languageName) voices on this iPhone")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(16)
-            .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .accessibilityIdentifier("guide.chooseVoice")
-    }
-
-    /// Apple's Premium voices worth pointing at, by language.
-    static func recommendedVoices(forLanguage key: String) -> [String] {
-        switch key {
-        case "en": return ["Ava", "Zoe", "Evan", "Nathan", "Serena (UK)", "Jamie (UK)"]
-        case "ja": return ["O-Ren", "Hattori", "Kyoko"]
-        case "de": return ["Anna", "Petra"]
-        case "fr": return ["Audrey", "Aurélie", "Amélie (Canada)"]
-        case "es": return ["Mónica", "Paulina (Mexico)"]
-        case "it": return ["Alice", "Federica"]
-        case "pt": return ["Luciana", "Joana"]
-        case "zh": return ["Tingting", "Lili"]
-        case "ko": return ["Yuna", "Suhyun"]
-        case "ru": return ["Milena"]
-        case "nl": return ["Claire", "Xander"]
-        case "sv": return ["Alva"]
-        default: return []
-        }
     }
 }

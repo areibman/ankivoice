@@ -28,11 +28,6 @@ public struct CommandRecognizer: Sendable {
         case stop
 
         public var id: String { rawValue }
-
-        /// True when this command grades the current card.
-        public var isRating: Bool {
-            self == .again || self == .hard || self == .good || self == .easy
-        }
     }
 
     /// Commands valid in each listening state.
@@ -77,9 +72,6 @@ table["show me"] = .reveal
         return table
     }()
 
-    /// Single words recognized as ratings during `awaitingRating`.
-    private static let ratingWords: Set<String> = ["again", "hard", "good", "easy", "wrong", "forgot", "forgotten", "difficult"]
-
     // MARK: - Recognition
 
     /// Finds the first command in `transcript` valid for `phase`.
@@ -107,24 +99,6 @@ table["show me"] = .reveal
             }
         }
         return nil
-    }
-
-    /// Strict rating recognition from a finalized utterance (post-endpoint).
-    /// The utterance may only contain a rating word (optionally surrounded by fillers).
-    public func recognizeRating(transcript: String) -> Rating? {
-        let normalized = Self.normalize(transcript)
-        let words = normalized.split(separator: " ").map(String.init)
-        // Ignore common politeness fillers around the command word.
-        let fillers: Set<String> = ["um", "uh", "er", "ah", "well", "okay", "ok", "please", "the", "it's", "its", "that's"]
-        let significant = words.filter { !fillers.contains($0) }
-        guard let only = significant.last, significant.count <= 2 else { return nil }
-        switch only {
-        case "again", "wrong", "forgot", "forgotten": return .again
-        case "hard", "difficult": return .hard
-        case "good": return .good
-        case "easy": return .easy
-        default: return nil
-        }
     }
 
     static func isValid(_ command: Command, in phase: ListeningPhase) -> Bool {

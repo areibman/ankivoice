@@ -1,9 +1,9 @@
 import Foundation
 import Compression
 
-/// Minimal ZIP archive reader supporting the methods Anki `.apkg` files use:
-/// stored (0) and deflate (8). Zstd-compressed entries (modern `.colpkg`
-/// backups) are reported as unsupported with an actionable message.
+/// Minimal ZIP archive reader supporting the methods Anki packages use:
+/// stored (0), deflate (8) and zstd (93). `collection.anki21b` is also a zstd
+/// frame when the entry itself is stored; `Zstd` unwraps that after extract.
 ///
 /// Built for large packages: the archive is memory-mapped rather than read
 /// into RAM, entries inflate through a streaming decoder, and
@@ -125,6 +125,15 @@ public struct ZipReader {
         case 8:  // deflate
             do {
                 try Self.inflate(compressed, sink: sink)
+            } catch {
+                throw ZipError.corruptEntry(entry.name)
+            }
+        case 93:  // zstd
+            do {
+                let decoded = try Zstd.decompress(compressed)
+                try decoded.withUnsafeBytes { bytes in
+                    if !bytes.isEmpty { try sink(bytes) }
+                }
             } catch {
                 throw ZipError.corruptEntry(entry.name)
             }
@@ -272,18 +281,6 @@ public struct ZipReader {
                 }
             } while status == COMPRESSION_STATUS_OK
         }
-    }
-
-    /// Convenience used by tests and small callers.
-    static func inflate(_ data: Data, expectedSize: Int) -> Data? {
-        var out = Data()
-        if expectedSize > 0, expectedSize < 256 * 1024 * 1024 { out.reserveCapacity(expectedSize) }
-        do {
-            try inflate(data) { out.append($0.bindMemory(to: UInt8.self)) }
-        } catch {
-            return nil
-        }
-        return out
     }
 }
 

@@ -3,7 +3,7 @@ import SwiftUI
 /// Card browser: search, inspect, edit, suspend, delete (PRD §23, §32).
 struct CardBrowserView: View {
     @Environment(AppServices.self) private var services
-    let deckID: Int64
+    let deckID: Int64?
     let deckName: String
 
     @State private var query = ""
@@ -26,6 +26,15 @@ struct CardBrowserView: View {
                         Label("Delete", systemImage: "trash")
                     }
                     Button {
+                        try? services.cards.setBuried(
+                            card.card.bury == .user ? .none : .user, until: nil, cardID: card.id
+                        )
+                        Task { await load() }
+                    } label: {
+                        Label(card.card.bury == .user ? "Unbury" : "Bury", systemImage: "archivebox")
+                    }
+                    .tint(.indigo)
+                    Button {
                         toggleSuspend(card)
                     } label: {
                         Label(
@@ -37,7 +46,7 @@ struct CardBrowserView: View {
                 }
             }
         }
-        .searchable(text: $query, prompt: "Search fronts, backs, tags")
+        .searchable(text: $query, prompt: "deck: tag: is:due prop:s>21")
         .onChange(of: query) {
             Task { await load() }
         }
@@ -50,7 +59,23 @@ struct CardBrowserView: View {
     }
 
     private func load() async {
-        cards = (try? services.cards.search(query: query, deckID: deckID)) ?? []
+        let pool = (try? services.cards.allStudyCards()) ?? []
+        let scoped: [StudyCard]
+        if let deckID, let root = try? services.decks.deck(id: deckID) {
+            let prefix = root.fullName
+            scoped = pool.filter {
+                $0.deck.fullName == prefix || $0.deck.fullName.hasPrefix(prefix + "::")
+            }
+        } else {
+            scoped = pool
+        }
+        let logs = (try? services.reviews.allChronological()) ?? []
+        let reviewed = Dictionary(grouping: logs, by: \.cardID)
+        let scheduler = FSRSScheduler()
+        let now = Date()
+        cards = Array(BrowserQuery.match(scoped, query: query, now: now, reviewed: reviewed) { card in
+            scheduler.retrievability(of: card.card.scheduling.memoryState, now: now)
+        }.prefix(2_000))
     }
 
     private func delete(_ card: StudyCard) {
@@ -67,10 +92,24 @@ struct CardBrowserView: View {
 private struct CardRow: View {
     let card: StudyCard
 
+    /// What's actually read, not the note's first two fields. Japanese decks
+    /// often lead with an index or a notes field, which made the list look
+    /// like the tutorial.
+    private var spokenLines: (question: String, answer: String) {
+        let rendered = SpeechRenderer().render(card, questionLocale: "en-US", answerLocale: "en-US")
+        let question = SpeechRenderer.plainText(of: rendered.question)
+        let answer = SpeechRenderer.plainText(of: rendered.answer)
+        return (
+            question.isEmpty ? CardText.plain(card.note.front) : question,
+            answer.isEmpty ? CardText.plain(card.note.back) : answer
+        )
+    }
+
     var body: some View {
+        let spoken = spokenLines
         VStack(alignment: .leading, spacing: 4) {
             HStack {
-                Text(String(card.note.front.prefix(120)))
+                Text(String(spoken.question.prefix(120)))
                     .font(.body)
                     .lineLimit(2)
                 if card.card.suspended {
@@ -78,7 +117,7 @@ private struct CardRow: View {
                         .foregroundStyle(.orange)
                 }
             }
-            Text(String(card.note.back.prefix(120)))
+            Text(String(spoken.answer.prefix(120)))
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)

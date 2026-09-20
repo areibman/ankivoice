@@ -84,8 +84,6 @@ public struct AnkiConnectClient: Sendable {
         public let modelName: String
         public let tags: [String]
         public let fields: [String: FieldValue]
-        public let mod: Double?
-        public let cards: [Int64]?
 
         /// Field values in template order.
         public var orderedFieldValues: [String] {
@@ -98,9 +96,6 @@ public struct AnkiConnectClient: Sendable {
         public let id: Int64
         /// Button pressed: 1 again … 4 easy (0 for manual/reset entries).
         public let ease: Int
-        public let ivl: Int
-        public let lastIvl: Int
-        public let factor: Int
         /// Duration in milliseconds.
         public let time: Int
         /// 0 learn, 1 review, 2 relearn, 3 filtered/early, 4 manual, 5 rescheduled.
@@ -125,6 +120,7 @@ public struct AnkiConnectClient: Sendable {
         public let type: Int?
         public let flds: [ModelField]?
         public let tmpls: [ModelTemplate]?
+        public let css: String?
     }
 
     // MARK: Configuration

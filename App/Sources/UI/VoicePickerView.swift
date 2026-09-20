@@ -34,6 +34,7 @@ struct VoicePickerView: View {
     @State private var speechRate: Double = 1.0
     @State private var showGuide = false
     @State private var tts = TextToSpeech()
+    @State private var supertonic = SupertonicTTS.shared
 
     init(mode: Mode = .defaults, initialLocale: String? = nil) {
         self.mode = mode
@@ -46,6 +47,7 @@ struct VoicePickerView: View {
                 languageSection
             }
             statusSection
+            supertonicSection
             defaultRowSection
             voiceSections
             if case .defaults = mode {
@@ -58,7 +60,7 @@ struct VoicePickerView: View {
         .onDisappear { tts.stopSpeaking() }
         .sensoryFeedback(.selection, trigger: currentSelection)
         .sheet(isPresented: $showGuide) {
-            NaturalVoiceGuideView(locale: requestedLocale, showsVoiceList: false)
+            NaturalVoiceGuideView(locale: requestedLocale)
                 .presentationDetents([.large])
         }
     }
@@ -134,11 +136,15 @@ struct VoicePickerView: View {
     /// Premium is the ceiling; everything below it gets a nudge — unless a
     /// better voice is already installed, in which case the fix is a tap.
     private func showsGuideButton(for status: VoiceQualityStatus) -> Bool {
-        !status.isPremium && status.betterInstalled == nil
+        guard status.voice?.kind != .supertonic3 else { return false }
+        return !status.isPremium && status.betterInstalled == nil
     }
 
     private func statusTitle(_ status: VoiceQualityStatus) -> String {
         guard let voice = status.voice else { return "No \(Self.languageName(languageKey)) voice" }
+        if voice.kind == .supertonic3 {
+            return "\(voice.name) · Supertonic 3"
+        }
         switch voice.quality {
         case .premium: return "\(voice.name) · Premium"
         case .enhanced: return "\(voice.name) · Enhanced"
@@ -151,6 +157,16 @@ struct VoicePickerView: View {
         guard let voice = status.voice else {
             return "Cards in this language can't be read until a voice is downloaded."
         }
+        if voice.kind == .supertonic3 {
+            switch supertonic.phase {
+            case .downloading:
+                return "Downloading the on-device model (about 400 MB). After that, \(language) cards are read entirely on this iPhone."
+            case .failed(let message):
+                return "Couldn't download Supertonic 3: \(message). Tap a voice below to retry, or pick an iOS voice."
+            default:
+                return "\(voice.name) reads \(language) cards on this iPhone with Supertonic 3 — no Apple voice download needed."
+            }
+        }
         if let better = status.betterInstalled {
             return "\(better.name) (\(better.qualityTitle)) is installed and sounds far more natural. Tap it below, or choose \(defaultRowTitle)."
         }
@@ -160,9 +176,10 @@ struct VoicePickerView: View {
         case .enhanced:
             return "Sounds good. A free Premium voice sounds even closer to a real person."
         case .compact:
+            let extra = " Or download Supertonic 3 below — one on-device model, then it reads cards locally."
             return status.isExplicit
-                ? "\(voice.name) is a basic built-in voice — the only kind installed for \(language). Natural voices are a free download."
-                : "Only \(voice.name), the basic built-in voice, is installed for \(language). Natural voices are a free download."
+                ? "\(voice.name) is a basic built-in voice — the only iOS kind installed for \(language). Natural voices are a free download.\(extra)"
+                : "Only \(voice.name), the basic built-in voice, is installed for \(language). Natural voices are a free download.\(extra)"
         }
     }
 
@@ -228,6 +245,79 @@ struct VoicePickerView: View {
     }
 
     @ViewBuilder
+    private var supertonicSection: some View {
+        Section {
+            downloadRow
+            ForEach(supertonicVoices, id: \.identifier) { voice in
+                voiceRow(voice, subtitle: voice.qualityTitle)
+            }
+        } header: {
+            Text("Supertonic 3 — on device")
+        } footer: {
+            Text(supertonicFooter)
+        }
+    }
+
+    @ViewBuilder
+    private var downloadRow: some View {
+        switch supertonic.phase {
+        case .idle:
+            Button {
+                startSupertonicDownload()
+            } label: {
+                Label("Download model (~400 MB)", systemImage: "arrow.down.circle")
+            }
+            .accessibilityIdentifier("voices.supertonic.download")
+        case .downloading:
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text("Downloading on-device model…")
+                        .foregroundStyle(.secondary)
+                }
+                if let fraction = supertonic.downloadFraction, fraction > 0 {
+                    ProgressView(value: fraction)
+                    Text("\(Int(fraction * 100))% of about 400 MB")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            }
+            .accessibilityIdentifier("voices.supertonic.downloading")
+        case .ready:
+            Label("Model on this iPhone", systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .accessibilityIdentifier("voices.supertonic.ready")
+        case .failed(let message):
+            VStack(alignment: .leading, spacing: 8) {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                Button {
+                    startSupertonicDownload()
+                } label: {
+                    Label("Retry download", systemImage: "arrow.clockwise")
+                }
+            }
+            .accessibilityIdentifier("voices.supertonic.failed")
+        }
+    }
+
+    private var supertonicFooter: String {
+        let language = Self.languageName(languageKey)
+        if SupertonicVoiceCatalog.supports(languageKey: languageKey) {
+            return "Ten speakers for \(language). Download the CoreML pack once (Wi‑Fi, about 400 MB from Hugging Face); after that it runs entirely on this iPhone. Automatic never picks it."
+        }
+        return "Ten speakers. \(language) isn’t in the 31-language training set, so cards use the model’s language-agnostic mode. Download the CoreML pack once (Wi‑Fi, about 400 MB); Automatic never picks it."
+    }
+
+    private func startSupertonicDownload() {
+        Task {
+            try? await supertonic.prepare()
+        }
+    }
+
+    @ViewBuilder
     private var voiceSections: some View {
         let grouped = groupedVoices
         ForEach(VoiceQualityTier.allCasesDescending, id: \.self) { tier in
@@ -255,7 +345,7 @@ struct VoicePickerView: View {
         }
     }
 
-    private func voiceRow(_ voice: VoiceCatalogVoice) -> some View {
+    private func voiceRow(_ voice: VoiceCatalogVoice, subtitle: String? = nil) -> some View {
         HStack(spacing: 12) {
             Button {
                 select(voice.identifier)
@@ -272,7 +362,7 @@ struct VoicePickerView: View {
                                     .background(.thinMaterial, in: Capsule())
                             }
                         }
-                        Text(Self.regionName(voice.language))
+                        Text(subtitle ?? Self.regionName(voice.language))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -332,7 +422,7 @@ struct VoicePickerView: View {
     private var defaultRowSubtitle: String {
         switch mode {
         case .defaults:
-            guard let auto = inventory.automaticVoice(for: requestedLocale, preferredQuality: services.settings.voiceQuality) else {
+            guard let auto = inventory.automaticVoice(for: requestedLocale) else {
                 return "No voice installed for this language"
             }
             return "Most natural installed voice · currently \(auto.name)"
@@ -370,12 +460,24 @@ struct VoicePickerView: View {
         inventory.voices(forLanguage: languageKey)
     }
 
+    private var appleVoices: [VoiceCatalogVoice] {
+        localizedVoices.filter { $0.kind == .apple }
+    }
+
+    private var supertonicVoices: [VoiceCatalogVoice] {
+        // Always list the ten speakers from the catalog, not the inventory
+        // snapshot — unsupported languages (Chinese, Thai, …) have Apple
+        // voices but used to hide this whole section.
+        SupertonicVoiceCatalog.voices(matching: languageKey)
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
     private var hasNovelty: Bool {
-        localizedVoices.contains(where: \.isNovelty)
+        appleVoices.contains(where: \.isNovelty)
     }
 
     private var groupedVoices: [VoiceQualityTier: [VoiceCatalogVoice]] {
-        let visible = localizedVoices.filter { showNovelty || !$0.isNovelty }
+        let visible = appleVoices.filter { showNovelty || !$0.isNovelty }
         var groups: [VoiceQualityTier: [VoiceCatalogVoice]] = [:]
         for voice in visible {
             groups[voice.quality, default: []].append(voice)
@@ -446,7 +548,7 @@ struct VoicePickerView: View {
         let text = VoiceSampleText.sample(for: voice.language)
         let rate = speechRate
         Task {
-            await tts.preview(voiceIdentifier: voice.identifier, text: text, rate: rate)
+            await tts.preview(voiceIdentifier: voice.identifier, text: text, rate: rate, locale: voice.language)
             // A newer preview may have interrupted this one; only the latest
             // gets to reset the play button.
             if previewGeneration == generation { speaking = nil }

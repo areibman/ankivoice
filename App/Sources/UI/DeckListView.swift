@@ -6,6 +6,7 @@ struct DeckListView: View {
     @State private var decks: [DeckRowModel] = []
     @State private var loaded = false
     @State private var showAddDeck = false
+    @State private var showBrowser = false
     @State private var loadFailed: String?
 
     struct DeckRowModel: Identifiable {
@@ -44,13 +45,13 @@ struct DeckListView: View {
                             }
                         }
                         Section {
-                            ForEach(decks) { row in
-                                NavigationLink(value: row.deck) {
-                                    DeckRow(row: row)
+                            ForEach(outline, id: \.row.id) { item in
+                                NavigationLink(value: item.row.deck) {
+                                    DeckRow(row: item.row, depth: item.depth)
                                 }
                                 .swipeActions {
                                     Button(role: .destructive) {
-                                        delete(row)
+                                        delete(item.row)
                                     } label: {
                                         Label("Delete", systemImage: "trash")
                                     }
@@ -67,6 +68,14 @@ struct DeckListView: View {
             }
             .navigationTitle("Decks")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        showBrowser = true
+                    } label: {
+                        Label("Browse", systemImage: "magnifyingglass")
+                    }
+                    .accessibilityIdentifier("decks.browse")
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showAddDeck = true
@@ -81,6 +90,11 @@ struct DeckListView: View {
             }
             .sheet(isPresented: $showAddDeck, onDismiss: { Task { await load() } }) {
                 AddDeckView()
+            }
+            .sheet(isPresented: $showBrowser) {
+                NavigationStack {
+                    CardBrowserView(deckID: nil, deckName: "All cards")
+                }
             }
             .alert("Something went wrong", isPresented: .init(
                 get: { loadFailed != nil }, set: { if !$0 { loadFailed = nil } }
@@ -100,7 +114,17 @@ struct DeckListView: View {
     }
 
     private var totalDue: Int {
-        decks.reduce(0) { $0 + $1.remaining.total }
+        decks.filter { $0.deck.parentID == nil }.reduce(0) { $0 + $1.remaining.total }
+    }
+
+    /// Depth-first outline so subdecks show under their parent, not only inside it.
+    private var outline: [(row: DeckRowModel, depth: Int)] {
+        func walk(_ parent: Int64?, depth: Int) -> [(row: DeckRowModel, depth: Int)] {
+            decks.filter { $0.deck.parentID == parent }
+                .sorted { $0.deck.name.localizedCaseInsensitiveCompare($1.deck.name) == .orderedAscending }
+                .flatMap { row in [(row: row, depth: depth)] + walk(row.id, depth: depth + 1) }
+        }
+        return walk(nil, depth: 0)
     }
 
     private var emptyState: some View {
@@ -122,11 +146,10 @@ struct DeckListView: View {
 
     private func load() async {
         do {
-            try SampleContent.seedIfNeeded(decks: services.decks, cards: services.cards)
+            try SampleContent.seedIfNeeded(decks: services.decks, cards: services.cards, settings: services.settings)
             var rows: [DeckRowModel] = []
-            // Only top-level decks are listed; child decks show inside the parent.
             let all = try services.decks.all()
-            for deck in all where deck.parentID == nil {
+            for deck in all {
                 let counts = try services.cards.counts(forDeck: deck.id)
                 let (study, _, lastStudied) = try services.decks.config(for: deck.id)
                 let remaining = (try? services.queue.remaining(forDeck: deck.id, config: study)) ?? .init()
@@ -154,11 +177,15 @@ struct DeckListView: View {
 
 private struct DeckRow: View {
     let row: DeckListView.DeckRowModel
+    var depth: Int = 0
 
     var body: some View {
         HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 5) {
-                Text(row.deck.fullName.replacingOccurrences(of: Deck.nameSeparator, with: " › "))
+                Text(depth == 0
+                     ? row.deck.fullName.replacingOccurrences(of: Deck.nameSeparator, with: " › ")
+                     : row.deck.name)
+                    .padding(.leading, CGFloat(depth) * 14)
                     .font(.headline)
                     .lineLimit(2)
                 HStack(spacing: 10) {
