@@ -103,3 +103,98 @@ final class BackgroundAudioTests: XCTestCase {
         requests.forEach { $0.endAudio() }
     }
 }
+
+/// On-device recognition drops one-word utterances unless the engine notices
+/// the speech itself and closes the request. These lock that decision.
+final class ShortUtteranceTests: XCTestCase {
+
+    func testWordThenQuietCountsAsAnEndedUtterance() throws {
+        var meter = UtteranceEnergyMeter()
+        for _ in 0..<10 { meter.observe(rms: 0.05, duration: 0.02) } // 200 ms
+        meter.observe(rms: 0.001, duration: 0.6)
+        let trailing = try XCTUnwrap(meter.trailingSilence)
+        XCTAssertEqual(trailing, 0.6, accuracy: 0.001)
+    }
+
+    func testAClickIsNotSpeech() {
+        var meter = UtteranceEnergyMeter()
+        meter.observe(rms: 0.4, duration: 0.02)
+        meter.observe(rms: 0.001, duration: 0.6)
+        XCTAssertNil(meter.trailingSilence)
+    }
+
+    func testOngoingSpeechDoesNotCountAsSilence() {
+        var meter = UtteranceEnergyMeter()
+        for _ in 0..<10 { meter.observe(rms: 0.05, duration: 0.02) }
+        meter.observe(rms: 0.001, duration: 0.2)
+        for _ in 0..<5 { meter.observe(rms: 0.05, duration: 0.02) }
+        XCTAssertNil(meter.trailingSilence, "a pause inside a phrase must not end it")
+    }
+
+    func testRoomToneDoesNotCountAsSpeech() {
+        var meter = UtteranceEnergyMeter()
+        for _ in 0..<100 { meter.observe(rms: 0.003, duration: 0.02) }
+        XCTAssertNil(meter.trailingSilence)
+    }
+
+    func testLoudBufferThenSilenceEndsTheUtterance() throws {
+        let meter = UtteranceEnergyMonitor()
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1))
+        let loud = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 3200))
+        loud.frameLength = 3200 // 200 ms
+        let samples = loud.floatChannelData![0]
+        for index in 0..<3200 {
+            samples[index] = sin(Float(index) * 0.4) * 0.25
+        }
+        meter.observe(loud)
+
+        let quiet = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 9600))
+        quiet.frameLength = 9600 // 600 ms
+        for index in 0..<9600 { quiet.floatChannelData![0][index] = 0 }
+        meter.observe(quiet)
+
+        let trailing = try XCTUnwrap(meter.trailingSilence())
+        XCTAssertGreaterThanOrEqual(trailing, SpeechVoiceEngine.shortUtteranceSilence)
+    }
+
+    func testShortCommandsCloseBeforeTheModelDiscardsThem() {
+        XCTAssertEqual(
+            SpeechVoiceEngine.unreportedSpeechSilence(phase: .awaitingRating, endpointMs: 2000),
+            SpeechVoiceEngine.shortUtteranceSilence
+        )
+        XCTAssertEqual(
+            SpeechVoiceEngine.unreportedSpeechSilence(phase: .paused, endpointMs: 2500),
+            SpeechVoiceEngine.shortUtteranceSilence
+        )
+        XCTAssertEqual(
+            SpeechVoiceEngine.unreportedSpeechSilence(phase: .awaitingAnswer, endpointMs: 900),
+            0.9,
+            accuracy: 0.001
+        )
+    }
+
+    func testTaskHintPrefersShortPhrasesOverDictation() {
+        XCTAssertEqual(SpeechVoiceEngine.recognitionTaskHint(for: .awaitingAnswer), .search)
+        XCTAssertEqual(SpeechVoiceEngine.recognitionTaskHint(for: .awaitingRating), .confirmation)
+        XCTAssertEqual(SpeechVoiceEngine.recognitionTaskHint(for: .paused), .confirmation)
+    }
+
+    func testForceFinalizeOnlyForUntranscribedSpeech() {
+        let required = SpeechVoiceEngine.shortUtteranceSilence
+        XCTAssertFalse(SpeechVoiceEngine.shouldForceFinalize(
+            hasTranscript: false, alreadyFinalizing: false, trailingSilence: nil, silenceRequired: required
+        ))
+        XCTAssertFalse(SpeechVoiceEngine.shouldForceFinalize(
+            hasTranscript: false, alreadyFinalizing: false, trailingSilence: 0.2, silenceRequired: required
+        ))
+        XCTAssertFalse(SpeechVoiceEngine.shouldForceFinalize(
+            hasTranscript: true, alreadyFinalizing: false, trailingSilence: 1, silenceRequired: required
+        ))
+        XCTAssertFalse(SpeechVoiceEngine.shouldForceFinalize(
+            hasTranscript: false, alreadyFinalizing: true, trailingSilence: 1, silenceRequired: required
+        ))
+        XCTAssertTrue(SpeechVoiceEngine.shouldForceFinalize(
+            hasTranscript: false, alreadyFinalizing: false, trailingSilence: required, silenceRequired: required
+        ))
+    }
+}

@@ -49,6 +49,13 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
     /// Words before this index already produced a command; later matches only.
     private var nextCommandWordIndex = 0
     private var silenceTask: Task<Void, Never>?
+    /// Hears speech the recognizer has not transcribed yet. On-device
+    /// recognition often emits nothing at all for a one-word utterance, so
+    /// the transcript-based watchdog never starts and the audio is discarded.
+    private let energyMeter = UtteranceEnergyMonitor()
+    /// True after the request was closed to force a hypothesis for short speech.
+    private var finalizingUtterance = false
+    private var finalizeTimeout: Task<Void, Never>?
 
     // Output.
     private var tts: TextToSpeech?
@@ -100,7 +107,7 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
         guard sfRecognizer.supportsOnDeviceRecognition else {
             throw VoiceEngineError.onDeviceUnavailable(self.commandLocale)
         }
-        sfRecognizer.defaultTaskHint = .dictation
+        sfRecognizer.defaultTaskHint = .search
         speechRecognizer = sfRecognizer
 
         // Open the microphone now, while the app is certain to be in the
@@ -172,17 +179,30 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
         lastSpeechAt = nil
         speechStartedReported = false
         nextCommandWordIndex = 0
+        clearShortUtteranceWait()
 
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true
-        request.taskHint = phase == .awaitingAnswer ? .dictation : .search
+        // Dictation waits for sentence-shaped speech and withholds a hypothesis
+        // for "easy" or a one-word answer. Search/confirmation commit sooner.
+        request.taskHint = Self.recognitionTaskHint(for: phase)
         request.contextualStrings = Self.contextualStrings(for: phase)
         request.requiresOnDeviceRecognition = true
         request.addsPunctuation = false
+
+        do {
+            try await startAudioCapture()
+        } catch {
+            request.endAudio()
+            throw error
+        }
+        // Stop or a newer window won while capture was starting.
+        guard generation == gen else {
+            request.endAudio()
+            return
+        }
+
         self.request = request
-
-        try await startAudioCapture()
-
         listening = true
         task = sfRecognizer.recognitionTask(with: request) { @Sendable [weak self] result, error in
             // Recognizer callbacks arrive on a private queue (hence
@@ -199,6 +219,9 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
 
         // Buffers only start reaching the recognizer once the task exists, so
         // nothing captured while the app was speaking leaks into this window.
+        // Reset the meter here too: a buffer can land between the earlier
+        // clear and this attach.
+        energyMeter.reset()
         sink.attach(request)
         startSilenceWatchdog(generation: gen)
         speechLog.info("[VOICE] listening phase=\(String(describing: self.phase), privacy: .public) gen=\(gen)")
@@ -218,6 +241,8 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
         listening = false
         silenceTask?.cancel()
         silenceTask = nil
+        clearShortUtteranceWait()
+        energyMeter.reset()
         sink.attach(nil)
         request?.endAudio()
         request = nil
@@ -269,6 +294,7 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
         // that causes), so it talks to the lock-protected sink instead of
         // touching engine state.
         let sink = self.sink
+        let energyMeter = self.energyMeter
         // AVAudioEngine raises Objective-C exceptions for a tap whose format
         // no longer matches the hardware (AirPods switching profiles mid-
         // session is the classic case). Catch them so the session degrades
@@ -277,6 +303,11 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
         try ObjCException.catching {
             inputNode.removeTap(onBus: 0)
             inputNode.installTap(onBus: 0, bufferSize: 1024, format: nil) { @Sendable buffer, _ in
+                // Level is measured only while a window is open, so speech
+                // from the speaker leaking into the mic doesn't count.
+                if sink.isAttached {
+                    energyMeter.observe(buffer)
+                }
                 sink.append(buffer)
             }
             audioEngine.prepare()
@@ -354,11 +385,14 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
         speechLog.info("[VOICE] restarting recognition (\(reason, privacy: .public))")
         stopRecognition()
         listening = true
+        let ticket = generation
         Task { [weak self] in
-            guard let self else { return }
+            guard let self, self.generation == ticket else { return }
             do {
                 try await self.beginRecognition()
             } catch {
+                // A stop or a newer window moved the generation on; it owns the mic.
+                guard self.generation == ticket || self.generation == ticket &+ 1 else { return }
                 self.listening = false
                 self.continuation.yield(.failure(VoiceEngineError.describe(error, locale: self.commandLocale)))
             }
@@ -376,32 +410,39 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
     private func handleRecognition(generation gen: Int, result: Recognition?, error: Error?) {
         guard gen == generation, listening else { return }
 
-        if let error {
-            handleRecognitionError(error as NSError)
-            return
-        }
-        guard let result else { return }
-
-        let text = result.text
-        let normalized = CommandRecognizer.normalize(text)
-        if !normalized.isEmpty, normalized != lastNormalizedTranscript {
-            lastNormalizedTranscript = normalized
-            lastTranscript = text
-            lastSpeechAt = Date()
-            if !speechStartedReported {
-                speechStartedReported = true
-                if phase == .awaitingAnswer {
-                    continuation.yield(.speechStarted)
+        // A non-empty hypothesis wins over a companion error. Closing a short
+        // utterance often delivers the word and "no speech" together; dropping
+        // the word is the bug this path exists to avoid.
+        var heardSpeech = false
+        if let result {
+            let text = result.text
+            let normalized = CommandRecognizer.normalize(text)
+            if !normalized.isEmpty, normalized != lastNormalizedTranscript {
+                heardSpeech = true
+                lastNormalizedTranscript = normalized
+                lastTranscript = text
+                lastSpeechAt = Date()
+                if !speechStartedReported {
+                    speechStartedReported = true
+                    if phase == .awaitingAnswer {
+                        continuation.yield(.speechStarted)
+                    }
                 }
+                continuation.yield(.transcript(text))
+                deliverCommandIfPresent(normalized: normalized)
             }
-            continuation.yield(.transcript(text))
-            deliverCommandIfPresent(normalized: normalized)
+            if result.isFinal {
+                clearShortUtteranceWait()
+                endUtterance(reason: "final result")
+                return
+            }
         }
 
-        if result.isFinal {
-            // The recognizer closed the utterance itself (its own endpoint,
-            // the one-minute cloud limit, or the request ending).
-            endUtterance(reason: "final result")
+        if heardSpeech { return }
+
+        if let error {
+            clearShortUtteranceWait()
+            handleRecognitionError(error as NSError)
         }
     }
 
@@ -482,6 +523,10 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
     /// the point at which speech that produced no command gets a spoken hint.
     /// Recognition partials trail speech by a few hundred milliseconds, so the
     /// effective pause the user experiences is roughly endpoint + that lag.
+    ///
+    /// When the recognizer has produced no transcript at all, a shorter quiet
+    /// stretch after detected speech closes the request instead. Leaving it
+    /// open is what makes "easy" and a one-word answer disappear.
     private func startSilenceWatchdog(generation gen: Int) {
         silenceTask?.cancel()
         let endpoint = Double(endpointMs) / 1000.0
@@ -496,13 +541,58 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
                     self.recoverFromLostCapture()
                     return
                 }
-                guard let last = self.lastSpeechAt else { continue }
-                if Date().timeIntervalSince(last) >= endpoint {
-                    self.endUtterance(reason: "silence")
+                if let last = self.lastSpeechAt {
+                    if Date().timeIntervalSince(last) >= endpoint {
+                        self.endUtterance(reason: "silence")
+                        return
+                    }
+                    continue
+                }
+                // No transcript yet. If the mic heard a word and then quiet,
+                // close the request so the on-device model has to commit
+                // instead of eventually reporting "no speech" and dropping it.
+                let required = Self.unreportedSpeechSilence(phase: self.phase, endpointMs: self.endpointMs)
+                if Self.shouldForceFinalize(
+                    hasTranscript: false,
+                    alreadyFinalizing: self.finalizingUtterance,
+                    trailingSilence: self.energyMeter.trailingSilence(),
+                    silenceRequired: required
+                ) {
+                    self.finalizeUnreportedSpeech()
                     return
                 }
             }
         }
+    }
+
+    /// Closes the recognition request without cancelling it, so the on-device
+    /// model has to return a hypothesis for the short audio it already has.
+    /// Cancelling here is what drops the word; `finish()` is what surfaces it.
+    private func finalizeUnreportedSpeech() {
+        guard listening, !finalizingUtterance, let request, let task else { return }
+        finalizingUtterance = true
+        let gen = generation
+        speechLog.info("[VOICE] ending audio to recognize a short utterance")
+        sink.attach(nil)
+        finalizeTimeout?.cancel()
+        finalizeTimeout = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(2000))
+            guard let self, self.generation == gen, self.listening, self.finalizingUtterance else { return }
+            if self.lastTranscript.isEmpty {
+                self.restartRecognition(reason: "short utterance produced no result")
+            } else {
+                // A hypothesis arrived without isFinal. Don't throw the words away.
+                self.endUtterance(reason: "short utterance")
+            }
+        }
+        request.endAudio()
+        task.finish()
+    }
+
+    private func clearShortUtteranceWait() {
+        finalizingUtterance = false
+        finalizeTimeout?.cancel()
+        finalizeTimeout = nil
     }
 
     // MARK: - Helpers
@@ -512,6 +602,47 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
         let speaker = TextToSpeech(mediaDirectory: try? AppServices.mediaDirectory())
         tts = speaker
         return speaker
+    }
+
+    /// Quiet after speech the recognizer still hasn't transcribed, before the
+    /// request is closed. Long enough for a word to decay into the buffer,
+    /// short enough that the on-device model hasn't discarded it. The rating
+    /// window's longer "um…" pause still applies once a transcript exists.
+    nonisolated static let shortUtteranceSilence: TimeInterval = 0.60
+
+    nonisolated static func recognitionTaskHint(for phase: CommandRecognizer.ListeningPhase) -> SFSpeechRecognitionTaskHint {
+        switch phase {
+        case .awaitingAnswer:
+            return .search
+        case .awaitingRating, .paused:
+            return .confirmation
+        }
+    }
+
+    /// Answer turns use the configured endpoint, so a patient pause still
+    /// holds the mic. Command turns cap it: two seconds of trailing silence
+    /// is long enough for the model to throw a one-word rating away.
+    nonisolated static func unreportedSpeechSilence(
+        phase: CommandRecognizer.ListeningPhase,
+        endpointMs: Int
+    ) -> TimeInterval {
+        let configured = Double(endpointMs) / 1000
+        switch phase {
+        case .awaitingAnswer:
+            return configured
+        case .awaitingRating, .paused:
+            return min(configured, shortUtteranceSilence)
+        }
+    }
+
+    nonisolated static func shouldForceFinalize(
+        hasTranscript: Bool,
+        alreadyFinalizing: Bool,
+        trailingSilence: TimeInterval?,
+        silenceRequired: TimeInterval
+    ) -> Bool {
+        guard !alreadyFinalizing, !hasTranscript, let trailingSilence else { return false }
+        return trailingSilence >= silenceRequired
     }
 
     /// Command words boosted in the recognizer's language model.
@@ -592,6 +723,130 @@ public final class SpeechVoiceEngine: VoiceSessionEngine {
         case .undetermined: return await AVAudioApplication.requestRecordPermission()
         @unknown default: return false
         }
+    }
+}
+
+// MARK: - Short-utterance energy meter
+
+/// Tracks whether the microphone has heard speech, independent of the recognizer.
+///
+/// On-device recognition often emits no partial and no final result for a
+/// single word. The engine uses this to notice the word anyway and close
+/// the request, which is what forces a hypothesis.
+struct UtteranceEnergyMeter: Sendable {
+    /// About −38 dBFS. Quiet room noise sits under this; a spoken word doesn't.
+    var minimumOnsetRMS: Float = 0.012
+    /// Shorter than this is a tap or a click, not a word.
+    var minimumSpeech: TimeInterval = 0.12
+
+    private(set) var noiseFloor: Float = 0.003
+    private var speaking = false
+    private var speechDuration: TimeInterval = 0
+    private var silenceDuration: TimeInterval = 0
+
+    /// Quiet time after speech long enough to be a word. Nil while the user
+    /// is still going, or if nothing long enough to be speech has been heard.
+    var trailingSilence: TimeInterval? {
+        guard speechDuration >= minimumSpeech, silenceDuration > 0 else { return nil }
+        return silenceDuration
+    }
+
+    mutating func reset() {
+        speaking = false
+        speechDuration = 0
+        silenceDuration = 0
+    }
+
+    mutating func observe(rms: Float, duration: TimeInterval) {
+        let dt = max(duration, 0)
+        guard dt > 0, rms.isFinite else { return }
+        let onset = max(minimumOnsetRMS, noiseFloor * 6)
+        let release = onset * 0.6
+
+        if !speaking {
+            if rms >= onset {
+                speaking = true
+                speechDuration = dt
+                silenceDuration = 0
+            } else {
+                adaptFloor(toward: rms)
+            }
+            return
+        }
+
+        if rms >= release {
+            speechDuration += dt
+            silenceDuration = 0
+        } else {
+            silenceDuration += dt
+        }
+    }
+
+    private mutating func adaptFloor(toward rms: Float) {
+        if rms < noiseFloor {
+            noiseFloor += (rms - noiseFloor) * 0.35
+        } else {
+            noiseFloor += (rms - noiseFloor) * 0.02
+        }
+    }
+
+    static func rms(of buffer: AVAudioPCMBuffer) -> Float {
+        let frames = Int(buffer.frameLength)
+        let channels = Int(buffer.format.channelCount)
+        guard frames > 0, channels > 0 else { return 0 }
+        if let data = buffer.floatChannelData {
+            var sum: Float = 0
+            for channel in 0..<channels {
+                let samples = data[channel]
+                for index in 0..<frames {
+                    let sample = samples[index]
+                    sum += sample * sample
+                }
+            }
+            return (sum / Float(frames * channels)).squareRoot()
+        }
+        if let data = buffer.int16ChannelData {
+            var sum: Float = 0
+            let scale = 1 / Float(Int16.max)
+            for channel in 0..<channels {
+                let samples = data[channel]
+                for index in 0..<frames {
+                    let sample = Float(samples[index]) * scale
+                    sum += sample * sample
+                }
+            }
+            return (sum / Float(frames * channels)).squareRoot()
+        }
+        return 0
+    }
+}
+
+/// Audio-thread side of `UtteranceEnergyMeter`. The render thread only holds
+/// the lock long enough to record one buffer's RMS.
+final class UtteranceEnergyMonitor: @unchecked Sendable {
+    private let lock = NSLock()
+    private var meter = UtteranceEnergyMeter()
+
+    func reset() {
+        lock.lock()
+        meter.reset()
+        lock.unlock()
+    }
+
+    func observe(_ buffer: AVAudioPCMBuffer) {
+        let rate = buffer.format.sampleRate
+        guard rate > 0, buffer.frameLength > 0 else { return }
+        let rms = UtteranceEnergyMeter.rms(of: buffer)
+        let duration = Double(buffer.frameLength) / rate
+        lock.lock()
+        meter.observe(rms: rms, duration: duration)
+        lock.unlock()
+    }
+
+    func trailingSilence() -> TimeInterval? {
+        lock.lock()
+        defer { lock.unlock() }
+        return meter.trailingSilence
     }
 }
 
