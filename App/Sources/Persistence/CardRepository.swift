@@ -434,6 +434,19 @@ public final class CardRepository: @unchecked Sendable {
         _ = try db.runUpdate("DELETE FROM notes WHERE id NOT IN (SELECT DISTINCT note_id FROM cards)")
     }
 
+    /// Removes a note, its cards, and their reviews. Notes are unique by guid,
+    /// so a replacement import has to delete the row, not only its cards.
+    public func deleteNote(_ noteID: Int64) throws {
+        let cardIDs = try db.query(
+            "SELECT id FROM cards WHERE note_id = ?", [.int(noteID)]
+        ) { $0.int(0) }
+        for cardID in cardIDs {
+            try db.run("DELETE FROM reviews WHERE card_id = ?", [.int(cardID)])
+        }
+        try db.run("DELETE FROM cards WHERE note_id = ?", [.int(noteID)])
+        try db.run("DELETE FROM notes WHERE id = ?", [.int(noteID)])
+    }
+
     /// Directly sets scheduling state — used by import and undo restore.
     public func replaceScheduling(_ scheduling: SchedulingState, cardID: Int64) throws {
         try db.run(

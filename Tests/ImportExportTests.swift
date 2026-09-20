@@ -837,6 +837,107 @@ final class ApkgExporterTests: XCTestCase {
         XCTAssertTrue(imported.note.fields[0].contains("cat"))
     }
 
+    /// Everyday Portuguese exports the note-type id as a string and only
+    /// generates the second card type (Speak). Both are valid Anki.
+    func testStringNoteTypeIDAndPartialCardsImport() throws {
+        let (_, decksRepo, cards, reviews) = try makeStores()
+        let result = try ApkgImporter(decks: decksRepo, cards: cards, reviews: reviews)
+            .importPackage(zip: ZipReader(data: try portugueseSpeakPackage()))
+        XCTAssertEqual(result.notesImported, 1)
+        XCTAssertEqual(result.cardsImported, 1)
+        let deck = try XCTUnwrap(try decksRepo.deck(named: "Portuguese - Everyday"))
+        let imported = try cards.cards(inDeck: deck.id)
+        XCTAssertEqual(imported.count, 1, "the Understand card was not in the package")
+        XCTAssertEqual(imported.first?.templateOrdinal, 1)
+        let study = try XCTUnwrap(try cards.studyCard(id: imported[0].id))
+        XCTAssertEqual(study.noteType.css, ".prompt { font-size: 31px; }")
+        let face = SpeechRenderer().face(study, side: .question, questionLocale: "en-US", answerLocale: "pt-BR")
+        XCTAssertTrue(face.html.contains("Please."))
+        XCTAssertTrue(face.html.contains("Say this in Brazilian Portuguese."))
+        XCTAssertFalse(face.html.contains("Por favor."), "the Speak card asks in English")
+    }
+
+    /// A previous import (or a deck delete) can leave the same guid attached
+    /// to the wrong note type, sometimes with no cards left. Replacing it
+    /// must delete that note row; guid is unique.
+    func testReimportReplacesNoteLeftOnTheWrongType() throws {
+        let apkg = try portugueseSpeakPackage()
+        let (db, decks, cards, reviews) = try makeStores()
+        let home = try decks.create(fullName: "Old")
+        let stale = try cards.createNote(
+            fields: ["ptbr-001", "Por favor."], tags: [], deckID: home.id,
+            noteTypeID: 1, guid: "ptv2"
+        )
+        try db.run("DELETE FROM cards WHERE note_id = ?", [.int(stale.id)])
+        XCTAssertNotNil(try cards.note(guid: "ptv2"))
+
+        let result = try ApkgImporter(decks: decks, cards: cards, reviews: reviews)
+            .importPackage(zip: ZipReader(data: apkg))
+        XCTAssertEqual(result.notesImported, 1)
+        let imported = try XCTUnwrap(try cards.note(guid: "ptv2"))
+        XCTAssertNotEqual(imported.noteTypeID, 1)
+        let card = try XCTUnwrap(try cards.cards(forNote: imported.id).first)
+        let study = try XCTUnwrap(try cards.studyCard(id: card.id))
+        XCTAssertEqual(study.noteType.name, "Brazilian Portuguese - Everyday v2")
+        XCTAssertEqual(study.card.templateOrdinal, 1)
+    }
+
+    private func portugueseSpeakPackage() throws -> Data {
+        let ankiURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pt-fixture-\(UUID().uuidString).sqlite")
+        defer { try? FileManager.default.removeItem(at: ankiURL) }
+        let db = try SQLiteDatabase.open(url: ankiURL)
+        for statement in [
+            """
+            CREATE TABLE col (
+                id INTEGER PRIMARY KEY, crt INTEGER, mod INTEGER, scm INTEGER, ver INTEGER,
+                dty INTEGER, usn INTEGER, ls INTEGER, conf TEXT,
+                models TEXT, decks TEXT, dconf TEXT, tags TEXT
+            );
+            """,
+            """
+            CREATE TABLE notes (
+                id INTEGER PRIMARY KEY, guid TEXT, mid INTEGER, mod INTEGER, usn INTEGER,
+                tags TEXT, flds TEXT, sfld TEXT, csum INTEGER, flags INTEGER, data TEXT
+            );
+            """,
+            """
+            CREATE TABLE cards (
+                id INTEGER PRIMARY KEY, nid INTEGER, did INTEGER, ord INTEGER,
+                type INTEGER, queue INTEGER, due INTEGER, ivl INTEGER, factor INTEGER,
+                reps INTEGER, lapses INTEGER, left INTEGER, odue INTEGER, odid INTEGER,
+                flags INTEGER, data TEXT
+            );
+            """,
+            "CREATE TABLE revlog (id INTEGER PRIMARY KEY, cid INTEGER, ease INTEGER, ivl INTEGER, lastIvl INTEGER, factor INTEGER, time INTEGER, type INTEGER);",
+        ] { try db.execute(statement) }
+
+        let models = """
+        {"1892609201":{"id":"1892609201","name":"Brazilian Portuguese - Everyday v2","type":0,"css":".prompt { font-size: 31px; }","flds":[{"name":"ID"},{"name":"Portuguese"},{"name":"English"},{"name":"Cue"}],"tmpls":[{"name":"Understand","qfmt":"{{Portuguese}}","afmt":"{{English}}","ord":0},{"name":"Speak","qfmt":"{{English}}<div class=\\"cue\\">{{Cue}}</div>","afmt":"{{Portuguese}}","ord":1}]}}
+        """
+        let decks = #"{"2092609201":{"id":2092609201,"name":"Portuguese - Everyday"}}"#
+        try db.run(
+            "INSERT INTO col (crt, ver, models, decks, conf, dconf, tags) VALUES (?,?,?,?,?,?,?)",
+            [.int(1_600_000_000), .int(11), .text(models), .text(decks), .text("{}"), .text("{}"), .text("")]
+        )
+        try db.run(
+            "INSERT INTO notes (id, guid, mid, tags, flds, sfld, csum) VALUES (?,?,?,?,?,?,0)",
+            [.int(10), .text("ptv2"), .int(1_892_609_201), .text("pt_br"),
+             .text("ptbr-001\u{1f}Por favor.\u{1f}Please.\u{1f}Say this in Brazilian Portuguese."), .text("Por favor.")]
+        )
+        try db.run(
+            "INSERT INTO cards (id, nid, did, ord, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [.int(20), .int(10), .int(2_092_609_201), .int(1), .int(0), .int(0), .int(1),
+             .int(0), .int(0), .int(0), .int(0), .int(0), .int(0), .int(0), .int(0), .text("")]
+        )
+        try db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        try db.execute("PRAGMA journal_mode=DELETE")
+        var writer = ZipWriter()
+        writer.add(name: "collection.anki2", data: try Data(contentsOf: ankiURL))
+        writer.add(name: "media", data: Data("{}".utf8))
+        return writer.finalize()
+    }
+
     func testMediaFilenameParsing() {
         XCTAssertEqual(
             ApkgExporter.mediaFilenames(in: ["[sound:foo.mp3]", #"<img src="bar.jpg">"#]),

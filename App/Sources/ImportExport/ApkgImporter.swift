@@ -45,6 +45,52 @@ public struct ApkgImporter: Sendable {
         let css: String?
         let flds: [AnkiField]?
         let tmpls: [AnkiTemplate]?
+
+        /// Some valid Anki exports store the note-type id as a string. A
+        /// strict Int64 decode drops the whole model, and the notes then
+        /// import as empty Basic cards.
+        init(id: Int64, name: String?, type: Int?, css: String?, flds: [AnkiField]?, tmpls: [AnkiTemplate]?) {
+            self.id = id
+            self.name = name
+            self.type = type
+            self.css = css
+            self.flds = flds
+            self.tmpls = tmpls
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            id = try container.decode(LenientInt64.self, forKey: .id).value
+            name = try container.decodeIfPresent(String.self, forKey: .name)
+            type = try container.decodeIfPresent(Int.self, forKey: .type)
+            css = try container.decodeIfPresent(String.self, forKey: .css)
+            flds = try container.decodeIfPresent([AnkiField].self, forKey: .flds)
+            tmpls = try container.decodeIfPresent([AnkiTemplate].self, forKey: .tmpls)
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id, name, type, css, flds, tmpls
+        }
+    }
+
+    /// JSON numbers or numeric strings. Anki has shipped note-type ids both ways.
+    private struct LenientInt64: Decodable {
+        let value: Int64
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.singleValueContainer()
+            if let int = try? container.decode(Int64.self) {
+                value = int
+                return
+            }
+            if let string = try? container.decode(String.self), let int = Int64(string) {
+                value = int
+                return
+            }
+            throw DecodingError.dataCorruptedError(
+                in: container, debugDescription: "Expected an integer or a numeric string"
+            )
+        }
     }
 
     private struct AnkiCol: Decodable {
@@ -267,8 +313,12 @@ public struct ApkgImporter: Sendable {
         let tags = note.tags.split(separator: " ").map(String.init).filter { $0 != "" }
         let localTypeID = noteTypeIDMap[note.mid] ?? 1
 
-        // Skip notes already present (same guid).
-        if try cardsRepo.note(guid: note.guid) != nil { return }
+        // Skip notes already present (same guid). A previous import that
+        // missed the note type leaves the note on Basic; replace that.
+        if let existing = try cardsRepo.note(guid: note.guid) {
+            if existing.noteTypeID == localTypeID { return }
+            try cardsRepo.deleteNote(existing.id)
+        }
 
         let noteCards = cardsByNote[note.id] ?? []
         guard let firstCard = noteCards.first else {
@@ -290,7 +340,14 @@ public struct ApkgImporter: Sendable {
         let readme = DeckTutorial.isReadme(fieldTexts: fields)
 
         // Reconcile card count with ordinals and apply scheduling.
-        let localCards = try cardsRepo.cards(forNote: created.id)
+        // Anki only generates the card types the package actually contains.
+        // Creating one card per template would invent a sibling the deck doesn't have.
+        let presentOrdinals = Set(noteCards.map(\.ord))
+        var localCards = try cardsRepo.cards(forNote: created.id)
+        for extra in localCards where !presentOrdinals.contains(Int(extra.templateOrdinal)) {
+            try cardsRepo.deleteCard(extra.id)
+        }
+        localCards.removeAll { !presentOrdinals.contains(Int($0.templateOrdinal)) }
         for ankiCard in noteCards {
             guard let local = localCards.first(where: { $0.templateOrdinal == ankiCard.ord })
                     ?? (localCards.indices.contains(ankiCard.ord) ? localCards[ankiCard.ord] : nil) else { continue }
