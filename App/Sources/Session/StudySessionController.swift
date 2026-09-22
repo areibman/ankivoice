@@ -38,6 +38,10 @@ public final class StudySessionController {
     private let reviews: ReviewRepository
     private let queue: StudyQueue
     private let renderer = SpeechRenderer()
+    /// Saved field toggles, keyed by note type. Missing means automatic.
+    private var spokenChoices: [Int64: SpokenFieldChoice] = [:]
+    /// Plain values of each field across a sample of the deck's notes.
+    private var speechSamples: [Int64: [String: [String]]] = [:]
     /// Scheduled, keep-going, or a filtered deck. Set before `start`.
     public var gather: StudyQueue.Gather = .scheduled
     /// Review cards already answered in a keep-going session, so the same card
@@ -146,6 +150,7 @@ public final class StudySessionController {
             gather = .filtered(reschedule: spec.reschedule)
         }
         voiceConfig = resolved(configs.1)
+        loadSpeechPlan(for: deck)
 
         do {
             try await engine.prepare(voice: voiceConfig, commandLocale: settings.commandLocale)
@@ -262,16 +267,38 @@ public final class StudySessionController {
         if let card = try? queue.next(forDeck: deckID, config: studyConfig, exclude: excluded, gather: gather) {
             currentCard = card
             cardShownAt = Date()
-            rendered = renderer.render(
-                card, questionLocale: voiceConfig.questionLocale,
-                answerLocale: voiceConfig.answerLocale
-            )
+            rendered = render(card)
             remaining = (try? queue.remaining(forDeck: deckID, config: studyConfig)) ?? .init()
             lastSpokenSide = .question
             await speakPrompt()
         } else {
             await finishSession()
         }
+    }
+
+    /// Fields read for this card. Automatic unless the deck settings override it.
+    public func spokenFields(for card: StudyCard) -> SpokenFieldSelection {
+        SpokenFieldPlanner.selection(
+            for: card,
+            samples: speechSamples[card.noteType.id] ?? [:],
+            choice: spokenChoices[card.noteType.id]
+        )
+    }
+
+    private func render(_ card: StudyCard) -> SpeechRenderer.RenderedCard {
+        renderer.render(
+            card,
+            questionLocale: voiceConfig.questionLocale,
+            answerLocale: voiceConfig.answerLocale,
+            spoken: spokenFields(for: card)
+        )
+    }
+
+    private func loadSpeechPlan(for deck: Deck) {
+        let ids = (try? cards.descendantDeckIDs(including: deck.id)) ?? [deck.id]
+        let sample = (try? cards.sampleStudyCards(inDeckIDs: ids, limit: 80)) ?? []
+        speechSamples = SpokenFieldPlanner.samples(from: sample)
+        spokenChoices = (try? decks.spokenFieldChoices(for: deck.id)) ?? [:]
     }
 
     private func speakPrompt() async {
@@ -711,10 +738,7 @@ public final class StudySessionController {
         if let restored = try? cards.studyCard(id: record.cardID) {
             currentCard = restored
             cardShownAt = Date()
-            rendered = renderer.render(
-                restored, questionLocale: voiceConfig.questionLocale,
-                answerLocale: voiceConfig.answerLocale
-            )
+            rendered = render(restored)
             remaining = (try? queue.remaining(forDeck: deck?.id ?? 0, config: studyConfig)) ?? .init()
             await speakPrompt()
         }

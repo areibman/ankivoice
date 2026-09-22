@@ -13,6 +13,8 @@ struct DeckSettingsView: View {
     @State private var installedVoices: [VoiceCatalogVoice] = []
     @State private var optimizing = false
     @State private var optimizeMessage: String?
+    @State private var speechGroups: [SpeechFieldGroup] = []
+    @State private var customizedSpeech: Set<Int64> = []
 
     var body: some View {
         Form {
@@ -66,6 +68,41 @@ struct DeckSettingsView: View {
                 Text("Voices")
             } footer: {
                 Text("Leave voices on Default to use the ones chosen in Settings ▸ Voices. How long a pause ends your answer is set for all decks under Settings ▸ Response speed.")
+            }
+
+            if !speechGroups.isEmpty {
+                Section {
+                    ForEach(speechGroups) { group in
+                        Text(group.name)
+                            .font(.subheadline.weight(.semibold))
+                        ForEach(group.fields, id: \.self) { field in
+                            HStack {
+                                Text(field)
+                                    .lineLimit(1)
+                                Spacer(minLength: 8)
+                                Toggle("Front", isOn: speechToggle(group: group.id, field: field, side: .question))
+                                    .labelsHidden()
+                                    .accessibilityLabel("\(field) on the front")
+                                Text("Front")
+                                    .font(.caption)
+                                    .foregroundStyle(group.question.contains(field) ? Color.primary : Color.secondary)
+                                Toggle("Back", isOn: speechToggle(group: group.id, field: field, side: .answer))
+                                    .labelsHidden()
+                                    .accessibilityLabel("\(field) on the back")
+                                Text("Back")
+                                    .font(.caption)
+                                    .foregroundStyle(group.answer.contains(field) ? Color.primary : Color.secondary)
+                            }
+                        }
+                        if customizedSpeech.contains(group.id) {
+                            Button("Use automatic") { resetSpeech(group.id) }
+                        }
+                    }
+                } header: {
+                    Text("Read aloud")
+                } footer: {
+                    Text("By default the voice reads the first field on each side that changes from card to card, and skips a line that stays the same, like a topic name. Turn fields on or off if it picks the wrong ones.")
+                }
             }
 
             Section {
@@ -200,7 +237,83 @@ struct DeckSettingsView: View {
         study = configs.0
         voice = configs.1
         installedVoices = AppVoiceCatalog().voices(matching: "")
+        loadSpeechFields()
         loaded = true
+    }
+
+    private func loadSpeechFields() {
+        let saved = (try? services.decks.spokenFieldChoices(for: deckID)) ?? [:]
+        let ids = (try? services.cards.descendantDeckIDs(including: deckID)) ?? [deckID]
+        let sample = (try? services.cards.sampleStudyCards(inDeckIDs: ids, limit: 80)) ?? []
+        let samples = SpokenFieldPlanner.samples(from: sample)
+        var groups: [SpeechFieldGroup] = []
+        var custom: Set<Int64> = []
+        let types = Dictionary(grouping: sample, by: \.noteType.id).map(\.value.first!.noteType)
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        for type in types {
+            let fieldSamples = samples[type.id] ?? [:]
+            var question: Set<String> = []
+            var answer: Set<String> = []
+            let templates = type.templates.isEmpty ? [NoteTemplate(name: "Card", questionFormat: "", answerFormat: "", ordinal: 0)] : type.templates
+            for template in templates {
+                question.formUnion(SpokenFieldPlanner.choose(
+                    shown: SpokenFieldPlanner.fields(in: template.questionFormat), samples: fieldSamples
+                ))
+                answer.formUnion(SpokenFieldPlanner.choose(
+                    shown: SpokenFieldPlanner.fields(in: template.answerFormat), samples: fieldSamples
+                ))
+            }
+            if let choice = saved[type.id] {
+                question = Set(choice.question)
+                answer = Set(choice.answer)
+                custom.insert(type.id)
+            }
+            groups.append(SpeechFieldGroup(
+                id: type.id, name: type.name, fields: type.fieldNames,
+                question: question, answer: answer
+            ))
+        }
+        speechGroups = groups
+        customizedSpeech = custom
+    }
+
+    private func speechToggle(group id: Int64, field: String, side: SpeechSide) -> Binding<Bool> {
+        Binding(
+            get: {
+                guard let group = speechGroups.first(where: { $0.id == id }) else { return false }
+                return side == .question ? group.question.contains(field) : group.answer.contains(field)
+            },
+            set: { on in
+                guard let index = speechGroups.firstIndex(where: { $0.id == id }) else { return }
+                if side == .question {
+                    if on { speechGroups[index].question.insert(field) }
+                    else { speechGroups[index].question.remove(field) }
+                } else if on {
+                    speechGroups[index].answer.insert(field)
+                } else {
+                    speechGroups[index].answer.remove(field)
+                }
+                customizedSpeech.insert(id)
+                saveSpeechFields()
+            }
+        )
+    }
+
+    private func resetSpeech(_ id: Int64) {
+        customizedSpeech.remove(id)
+        saveSpeechFields()
+        loadSpeechFields()
+    }
+
+    private func saveSpeechFields() {
+        var stored: [Int64: SpokenFieldChoice] = [:]
+        for group in speechGroups where customizedSpeech.contains(group.id) {
+            stored[group.id] = SpokenFieldChoice(
+                question: group.fields.filter { group.question.contains($0) },
+                answer: group.fields.filter { group.answer.contains($0) }
+            )
+        }
+        try? services.decks.updateSpokenFieldChoices(stored, for: deckID)
     }
 
     /// An Apple voice pinned to the old language can't read the new one.
@@ -253,4 +366,12 @@ struct DeckSettingsView: View {
         "pt-BR", "zh-CN", "ko-KR", "ru-RU", "ar-SA", "hi-IN", "nl-NL",
         "pl-PL", "tr-TR", "sv-SE", "th-TH", "vi-VN", "he-IL",
     ]
+}
+
+private struct SpeechFieldGroup: Identifiable {
+    var id: Int64
+    var name: String
+    var fields: [String]
+    var question: Set<String>
+    var answer: Set<String>
 }

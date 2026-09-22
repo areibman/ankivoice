@@ -289,6 +289,23 @@ public final class CardRepository: @unchecked Sendable {
         ) { Self.rowToStudyCard($0) }
     }
 
+    /// Cards from a deck and its subdecks, capped, for deciding which fields
+    /// change from card to card.
+    public func sampleStudyCards(inDeckIDs ids: [Int64], limit: Int) throws -> [StudyCard] {
+        let clamped = max(1, min(limit, 80))
+        guard !ids.isEmpty else { return [] }
+        let placeholders = ids.map { _ in "?" }.joined(separator: ",")
+        return try db.query(
+            """
+            \(Self.studyCardSQL)
+            WHERE c.deck_id IN (\(placeholders))
+            ORDER BY n.id, c.template_ordinal
+            LIMIT \(clamped)
+            """,
+            ids.map { .int($0) }
+        ) { Self.rowToStudyCard($0) }
+    }
+
     public func allStudyCards() throws -> [StudyCard] {
         try db.query(
             "\(Self.studyCardSQL) ORDER BY n.id, c.template_ordinal"

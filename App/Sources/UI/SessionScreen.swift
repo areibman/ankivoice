@@ -262,7 +262,8 @@ struct SessionBody: View {
                         card,
                         side: shownSide == .answer ? .answer : .question,
                         questionLocale: controller.questionLocale,
-                        answerLocale: controller.answerLocale
+                        answerLocale: controller.answerLocale,
+                        spoken: controller.spokenFields(for: card)
                     ),
                     mediaDirectory: try? AppServices.mediaDirectory()
                 )

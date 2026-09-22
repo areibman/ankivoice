@@ -9,6 +9,8 @@ struct CardBrowserView: View {
     @State private var query = ""
     @State private var cards: [StudyCard] = []
     @State private var editing: StudyCard?
+    @State private var speechSamples: [Int64: [String: [String]]] = [:]
+    @State private var speechChoices: [Int64: SpokenFieldChoice] = [:]
 
     var body: some View {
         List {
@@ -16,7 +18,11 @@ struct CardBrowserView: View {
                 Button {
                     editing = card
                 } label: {
-                    CardRow(card: card)
+                    CardRow(
+                        card: card,
+                        samples: speechSamples[card.noteType.id] ?? [:],
+                        choice: speechChoices[card.noteType.id]
+                    )
                 }
                 .buttonStyle(.plain)
                 .swipeActions {
@@ -76,6 +82,12 @@ struct CardBrowserView: View {
         cards = Array(BrowserQuery.match(scoped, query: query, now: now, reviewed: reviewed) { card in
             scheduler.retrievability(of: card.card.scheduling.memoryState, now: now)
         }.prefix(2_000))
+        speechSamples = SpokenFieldPlanner.samples(from: Array(scoped.prefix(80)))
+        if let deckID {
+            speechChoices = (try? services.decks.spokenFieldChoices(for: deckID)) ?? [:]
+        } else {
+            speechChoices = [:]
+        }
     }
 
     private func delete(_ card: StudyCard) {
@@ -91,12 +103,17 @@ struct CardBrowserView: View {
 
 private struct CardRow: View {
     let card: StudyCard
+    var samples: [String: [String]] = [:]
+    var choice: SpokenFieldChoice?
 
     /// What's actually read, not the note's first two fields. Japanese decks
     /// often lead with an index or a notes field, which made the list look
     /// like the tutorial.
     private var spokenLines: (question: String, answer: String) {
-        let rendered = SpeechRenderer().render(card, questionLocale: "en-US", answerLocale: "en-US")
+        let spoken = SpokenFieldPlanner.selection(for: card, samples: samples, choice: choice)
+        let rendered = SpeechRenderer().render(
+            card, questionLocale: "en-US", answerLocale: "en-US", spoken: spoken
+        )
         let question = SpeechRenderer.plainText(of: rendered.question)
         let answer = SpeechRenderer.plainText(of: rendered.answer)
         return (

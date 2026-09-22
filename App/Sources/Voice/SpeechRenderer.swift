@@ -66,9 +66,14 @@ public struct SpeechRenderer: Sendable {
     ///
     /// A side is one locale and therefore one voice. Splitting a card into
     /// script runs made foreign decks hop between speakers on every field.
-    public func render(_ card: StudyCard, questionLocale: String, answerLocale: String) -> RenderedCard {
-        let (questionText, questionMedia) = Self.speechPieces(for: card, side: .question)
-        let (answerText, answerMedia) = Self.speechPieces(for: card, side: .answer)
+    public func render(
+        _ card: StudyCard,
+        questionLocale: String,
+        answerLocale: String,
+        spoken: SpokenFieldSelection? = nil
+    ) -> RenderedCard {
+        let (questionText, questionMedia) = Self.speechPieces(for: card, side: .question, only: spoken?.question)
+        let (answerText, answerMedia) = Self.speechPieces(for: card, side: .answer, only: spoken?.answer)
         return RenderedCard(
             question: questionMedia.map { .media(filename: $0) }
                 + segments(fromText: questionText, locale: questionLocale),
@@ -82,10 +87,13 @@ public struct SpeechRenderer: Sendable {
         _ card: StudyCard,
         side: Side,
         questionLocale: String,
-        answerLocale: String
+        answerLocale: String,
+        spoken: SpokenFieldSelection? = nil
     ) -> RenderedFace {
         let html = Self.prepareDisplay(Self.templateOutput(for: card, side: side, mode: .display))
-        let rendered = render(card, questionLocale: questionLocale, answerLocale: answerLocale)
+        let rendered = render(
+            card, questionLocale: questionLocale, answerLocale: answerLocale, spoken: spoken
+        )
         let segments = side == .question ? rendered.question : rendered.answer
         var spoken = Self.plainText(of: segments)
         if spoken.isEmpty, html.range(of: "<img", options: .caseInsensitive) != nil {
@@ -188,7 +196,14 @@ public struct SpeechRenderer: Sendable {
     /// per side — the word on the front, the meaning on the back. The rest of
     /// an Anki template (frequency rank, part of speech, deck credits, notes,
     /// example sentences) stays on screen and is not read.
-    private static func speechPieces(for card: StudyCard, side: Side) -> (String, [String]) {
+    private static func speechPieces(
+        for card: StudyCard,
+        side: Side,
+        only names: [String]? = nil
+    ) -> (String, [String]) {
+        if let names {
+            return namedSpeech(names, card: card, side: side)
+        }
         if card.noteType.kind == .cloze {
             return templateSpeech(for: card, side: side)
         }
@@ -203,6 +218,28 @@ public struct SpeechRenderer: Sendable {
             }
         }
         return (text, sounds)
+    }
+
+    /// Speaks the fields the deck asked for, in template order, and still
+    /// plays any `[sound:]` file the template shows. Field text that isn't
+    /// selected is not read.
+    private static func namedSpeech(_ names: [String], card: StudyCard, side: Side) -> (String, [String]) {
+        let template = card.noteType.templates.first { $0.ordinal == card.card.templateOrdinal }
+            ?? card.noteType.templates.first
+        let format = template.map { side == .question ? $0.questionFormat : $0.answerFormat } ?? ""
+        let visible = SpokenFieldPlanner.fields(in: format)
+        let wanted = Set(names.map { $0.lowercased() })
+        var chunks: [String] = []
+        var media: [String] = []
+        for name in visible {
+            let value = lookupField(name, card: card)
+            let (text, more) = extract(html: prepareSpeech(value), clozeAnswer: side == .answer)
+            for file in more where !media.contains(file) { media.append(file) }
+            guard wanted.contains(name.lowercased()) else { continue }
+            let spoken = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !spoken.isEmpty { chunks.append(spoken) }
+        }
+        return (chunks.joined(separator: "\u{2028}"), media)
     }
 
     private static func templateSpeech(for card: StudyCard, side: Side) -> (String, [String]) {
@@ -286,7 +323,11 @@ public struct SpeechRenderer: Sendable {
             let ranked = fields.filter { answerRank($0.name) > 0 }
             // A reversed card's answer is {{Front}}. The name isn't "meaning",
             // so when nothing scores as an answer, speak the first real field.
-            let pool = ranked.isEmpty ? fields.filter { !isAudioName($0.name) && !isMetadataName($0.name) } : ranked
+            // Example sentences stay out of that fallback only when a real
+            // answer field is present; they are not preferred over it.
+            let pool = ranked.isEmpty
+                ? fields.filter { !isAudioName($0.name) && !isMetadataName($0.name) && !isHeadingName($0.name) }
+                : ranked
             guard let best = pool.map({ answerRank($0.name) }).max() else { return nil }
             return pool.first { answerRank($0.name) == best }?.value
         }
@@ -309,12 +350,30 @@ public struct SpeechRenderer: Sendable {
         return tokens.contains("audio") || tokens.contains("sound")
     }
 
-    private static func promptRank(_ name: String) -> Int {
-        if isMetadataName(name) { return -1 }
+    /// Lesson labels such as "Asking for things" share the front of a lot of
+    /// phrase decks. They are not the card. A real prompt token in the same
+    /// name ("Topic Sentence") still counts as the card.
+    private static let headingTokens: Set<String> = [
+        "lesson", "lessons", "unit", "units", "chapter", "chapters",
+        "topic", "topics", "category", "categories", "section", "sections",
+        "theme", "themes", "header", "heading", "headings", "situation", "situations",
+    ]
+
+    private static let promptTokens: Set<String> = [
+        "expression", "kanji", "word", "vocab", "vocabulary", "front", "question",
+        "term", "prompt", "sentence", "sentences", "phrase", "phrases", "example", "examples",
+    ]
+
+    private static func isHeadingName(_ name: String) -> Bool {
         let tokens = FlashcardPreview.FieldRole.tokens(in: name)
-        if tokens.contains(where: { ["expression", "kanji", "word", "vocab", "vocabulary", "front", "question", "term", "prompt"].contains($0) }) {
-            return 3
-        }
+        if tokens.contains(where: { promptTokens.contains($0) }) { return false }
+        return tokens.contains(where: { headingTokens.contains($0) })
+    }
+
+    private static func promptRank(_ name: String) -> Int {
+        if isMetadataName(name) || isHeadingName(name) { return -1 }
+        let tokens = FlashcardPreview.FieldRole.tokens(in: name)
+        if tokens.contains(where: { promptTokens.contains($0) }) { return 3 }
         return 1
     }
 
@@ -328,7 +387,8 @@ public struct SpeechRenderer: Sendable {
         if tokens.contains(where: { ["reading", "kana", "hiragana", "romaji", "pinyin"].contains($0) }) {
             return 2
         }
-        if tokens.contains(where: { ["sentence", "example"].contains($0) }) { return 1 }
+        // An example is extra. Ranking it above 0 makes "Um café, por favor."
+        // beat the actual answer "Por favor." when both are on the back.
         return 0
     }
 
@@ -882,5 +942,129 @@ public struct SpeechRenderer: Sendable {
             UnicodeScalar(Int(dec) ?? 0).map(String.init) ?? ""
         }
         return result
+    }
+}
+
+/// Fields to read on one card. Built from what changes across the deck, or
+/// from the toggles in deck settings.
+public struct SpokenFieldSelection: Sendable, Hashable {
+    public var question: [String]
+    public var answer: [String]
+
+    public init(question: [String], answer: [String]) {
+        self.question = question
+        self.answer = answer
+    }
+}
+
+/// Picks what to read without knowing a particular deck's field names.
+///
+/// A field the template shows is a label, not the card, when the same text
+/// appears on most of the cards (a topic, a cue, a chapter title). A value
+/// that is only a number, a URL, or a filename is not read either. Whatever
+/// is left, the first field in the template is the prompt. Deck settings
+/// can replace that choice.
+enum SpokenFieldPlanner {
+    /// Field names in the order the template mentions them. Special Anki
+    /// fields (`{{Deck}}`, `{{FrontSide}}`, cloze markers) are not content.
+    static func fields(in template: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: #"\{\{([^}]+)\}\}"#) else { return [] }
+        let ns = template as NSString
+        var seen: Set<String> = []
+        var names: [String] = []
+        let ignored: Set<String> = ["frontside", "tags", "deck", "subdeck", "type", "card"]
+        for match in regex.matches(in: template, range: NSRange(location: 0, length: ns.length)) {
+            guard match.numberOfRanges > 1 else { continue }
+            var token = ns.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespaces)
+            if token.hasPrefix("#") || token.hasPrefix("^") || token.hasPrefix("/") { continue }
+            if token.lowercased().hasPrefix("c"), token.dropFirst().first?.isNumber == true { continue }
+            if let colon = token.firstIndex(of: ":") {
+                let head = token[..<colon].lowercased()
+                let known = ["text", "furigana", "kana", "kanji", "hint", "type", "cloze", "edit"]
+                if known.contains(head) || head.hasPrefix("tts") {
+                    token = String(token[token.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+                }
+            }
+            let key = token.lowercased()
+            if ignored.contains(key) || !seen.insert(key).inserted { continue }
+            names.append(token)
+        }
+        return names
+    }
+
+    /// The field to read, or empty when nothing on this side is worth saying.
+    static func choose(shown: [String], samples: [String: [String]]) -> [String] {
+        let content = shown.filter { name in
+            let usable = (samples[name] ?? []).map(plain).filter { !$0.isEmpty && !isHousekeeping($0) }
+            guard !usable.isEmpty else { return false }
+            return !isRepeatedLabel(usable)
+        }
+        return Array(content.prefix(1))
+    }
+
+    static func plain(_ html: String) -> String {
+        HTMLText.plain(html)
+    }
+
+    /// Same text on card after card. A handful of cards is not enough to tell.
+    static func isRepeatedLabel(_ values: [String]) -> Bool {
+        guard values.count >= 4 else { return false }
+        let distinct = Set(values.map { $0.lowercased() })
+        if distinct.count <= 1 { return true }
+        let ratio = Double(distinct.count) / Double(values.count)
+        return distinct.count <= 12 && ratio <= 0.35
+    }
+
+    static func isHousekeeping(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return true }
+        if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") { return true }
+        let numeric = CharacterSet.decimalDigits.union(CharacterSet(charactersIn: ",.- "))
+        if trimmed.unicodeScalars.allSatisfy({ numeric.contains($0) }),
+           trimmed.contains(where: \.isNumber) {
+            return true
+        }
+        return trimmed.range(
+            of: #"^\S+\.(mp3|ogg|wav|m4a|jpg|jpeg|png|gif|svg|webp)$"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+    }
+
+    /// Samples of every field, keyed by note type, then field name.
+    static func samples(from cards: [StudyCard]) -> [Int64: [String: [String]]] {
+        var out: [Int64: [String: [String]]] = [:]
+        var seenNotes: Set<Int64> = []
+        for card in cards {
+            guard seenNotes.insert(card.note.id).inserted else { continue }
+            let id = card.noteType.id
+            for (index, name) in card.noteType.fieldNames.enumerated() {
+                let raw = index < card.note.fields.count ? card.note.fields[index] : ""
+                out[id, default: [:]][name, default: []].append(raw)
+            }
+        }
+        return out
+    }
+
+    static func selection(
+        for card: StudyCard,
+        samples: [String: [String]],
+        choice: SpokenFieldChoice?
+    ) -> SpokenFieldSelection {
+        let template = card.noteType.templates.first { $0.ordinal == card.card.templateOrdinal }
+            ?? card.noteType.templates.first
+        let questionShown = fields(in: template?.questionFormat ?? "")
+        let answerShown = fields(in: template?.answerFormat ?? "")
+        func resolve(shown: [String], custom: [String]?) -> [String] {
+            if let custom {
+                let allow = Set(custom.map { $0.lowercased() })
+                let picked = shown.filter { allow.contains($0.lowercased()) }
+                if !picked.isEmpty { return picked }
+            }
+            return choose(shown: shown, samples: samples)
+        }
+        return SpokenFieldSelection(
+            question: resolve(shown: questionShown, custom: choice?.question),
+            answer: resolve(shown: answerShown, custom: choice?.answer)
+        )
     }
 }

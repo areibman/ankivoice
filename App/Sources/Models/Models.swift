@@ -182,6 +182,18 @@ public struct StudyConfig: Codable, Sendable, Hashable {
     }
 }
 
+/// Which fields of one note type are read aloud. Stored on the deck when
+/// the automatic choice isn't right. Fields not listed are silent.
+public struct SpokenFieldChoice: Codable, Sendable, Hashable {
+    public var question: [String]
+    public var answer: [String]
+
+    public init(question: [String], answer: [String]) {
+        self.question = question
+        self.answer = answer
+    }
+}
+
 /// Which side of a card is being spoken. Lets the synthesizer pick the
 /// question or answer voice even when both sides share a locale.
 public enum SpeechSide: Codable, Sendable, Hashable {

@@ -400,8 +400,14 @@ public struct ApkgImporter: Sendable {
             guard !sample.isEmpty else { continue }
             var questions: [String] = []
             var answers: [String] = []
+            let samples = SpokenFieldPlanner.samples(from: sample)
             for card in sample.prefix(16) {
-                let rendered = renderer.render(card, questionLocale: "en-US", answerLocale: "en-US")
+                let spoken = SpokenFieldPlanner.selection(
+                    for: card, samples: samples[card.noteType.id] ?? [:], choice: nil
+                )
+                let rendered = renderer.render(
+                    card, questionLocale: "en-US", answerLocale: "en-US", spoken: spoken
+                )
                 questions.append(SpeechRenderer.plainText(of: rendered.question))
                 answers.append(SpeechRenderer.plainText(of: rendered.answer))
             }

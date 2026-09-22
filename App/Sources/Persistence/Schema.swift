@@ -2,7 +2,7 @@ import Foundation
 
 /// Database schema creation and migration.
 public enum Schema {
-    public static let version = 5
+    public static let version = 6
 
     public static func migrate(db: SQLiteDatabase) throws {
         try db.transaction {
@@ -24,6 +24,9 @@ public enum Schema {
             }
             if current < 5 {
                 try migrateV5(db: db)
+            }
+            if current < 6 {
+                try migrateV6(db: db)
             }
 
             try db.run("PRAGMA user_version = \(version)")
@@ -90,6 +93,15 @@ public enum Schema {
         let columns = try db.query("PRAGMA table_info(note_types)") { $0.string(1) }
         if !columns.contains("css") {
             try db.execute("ALTER TABLE note_types ADD COLUMN css TEXT NOT NULL DEFAULT '';")
+        }
+    }
+
+    /// v6: per-deck choice of which note fields are read aloud. Null means
+    /// the automatic pick (fields that change from card to card).
+    private static func migrateV6(db: SQLiteDatabase) throws {
+        let columns = try db.query("PRAGMA table_info(decks)") { $0.string(1) }
+        if !columns.contains("spoken_fields") {
+            try db.execute("ALTER TABLE decks ADD COLUMN spoken_fields TEXT;")
         }
     }
 

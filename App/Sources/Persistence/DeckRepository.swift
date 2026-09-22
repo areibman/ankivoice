@@ -251,6 +251,30 @@ public final class DeckRepository: @unchecked Sendable {
         )
     }
 
+    public func spokenFieldChoices(for id: Int64) throws -> [Int64: SpokenFieldChoice] {
+        let raw = try db.query(
+            "SELECT spoken_fields FROM decks WHERE id = ?",
+            [.int(id)]
+        ) { $0.stringOrNil(0) }.first ?? nil
+        guard let raw, let data = raw.data(using: .utf8) else { return [:] }
+        let decoded = (try? JSONDecoder().decode([String: SpokenFieldChoice].self, from: data)) ?? [:]
+        var result: [Int64: SpokenFieldChoice] = [:]
+        for (key, value) in decoded {
+            if let id = Int64(key) { result[id] = value }
+        }
+        return result
+    }
+
+    public func updateSpokenFieldChoices(_ choices: [Int64: SpokenFieldChoice], for id: Int64) throws {
+        let encoded = Dictionary(uniqueKeysWithValues: choices.map { (String($0.key), $0.value) })
+        let data = try JSONEncoder().encode(encoded)
+        let text = String(data: data, encoding: .utf8)
+        try db.run(
+            "UPDATE decks SET spoken_fields = ?, modified_at = ? WHERE id = ?",
+            [.optionalText(text), .date(Date()), .int(id)]
+        )
+    }
+
     public func markStudied(_ id: Int64, at date: Date = Date()) throws {
         try db.run("UPDATE decks SET last_studied_at = ? WHERE id = ?", [.date(date), .int(id)])
     }

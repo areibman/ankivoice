@@ -143,6 +143,78 @@ final class SpeechRendererTests: XCTestCase {
         XCTAssertTrue(engineText(rendered.answer).contains("cat"))
     }
 
+    /// Phrase decks put a section title ("Asking for things") on the front
+    /// next to the sentence. The title is not the card.
+    func testLessonHeadingIsNotSpokenInsteadOfTheSentence() {
+        let type = NoteType(
+            id: 12, name: "Phrases",
+            fieldNames: ["Lesson", "Sentence", "Translation"],
+            templates: [NoteTemplate(
+                name: "Card 1",
+                questionFormat: "<div class=\"lesson\">{{Lesson}}</div>{{Sentence}}",
+                answerFormat: "{{Translation}}",
+                ordinal: 0
+            )],
+            kind: .standard
+        )
+        let note = Note(
+            id: 1, noteTypeID: 12,
+            fields: ["Asking for things", "Could I have a menu, please?", "メニューをお願いできますか。"],
+            tags: [], guid: "g"
+        )
+        let deck = Deck(id: 1, name: "D", fullName: "Phrases::Asking for things", parentID: nil)
+        let card = StudyCard(card: Card(id: 1, noteID: 1, deckID: 1, templateOrdinal: 0), note: note, noteType: type, deck: deck)
+        let question = engineText(renderer.render(card, questionLocale: "en-US", answerLocale: "ja-JP").question)
+        XCTAssertEqual(question, "Could I have a menu, please?")
+        XCTAssertFalse(question.localizedCaseInsensitiveContains("asking for things"))
+    }
+
+    /// Portuguese Everyday v2. Topic is the section label ("Asking for things").
+    /// Understand asks the Portuguese line; Speak asks the English line.
+    /// The example on the back must not replace the answer.
+    func testPortugueseEverydaySpeaksThePromptNotTheTopic() {
+        let fields = [
+            "ptbr-everyday-001", "Por favor.", "Please.",
+            "Say this in Brazilian Portuguese.", "Um café, por favor.", "A coffee, please.",
+            "Add this to a request.", "", "Asking for things", "phrase", "", "",
+        ]
+        let names = [
+            "ID", "Portuguese", "English", "Cue", "ExamplePortuguese", "ExampleEnglish",
+            "Usage", "Alternatives", "Topic", "Kind", "AudioPortuguese", "AudioExample",
+        ]
+        let understand = NoteTemplate(
+            name: "Understand",
+            questionFormat: "<div class=\"meta\">{{Topic}} · Understand</div><div class=\"prompt\">{{Portuguese}}</div>{{#AudioPortuguese}}{{AudioPortuguese}}{{/AudioPortuguese}}<div class=\"cue\">What does this mean in English?</div>",
+            answerFormat: "{{FrontSide}}<hr>{{English}}{{#ExamplePortuguese}}<div class=\"label\">Example</div>{{ExamplePortuguese}}{{ExampleEnglish}}{{/ExamplePortuguese}}{{#Usage}}{{Usage}}{{/Usage}}",
+            ordinal: 0
+        )
+        let speak = NoteTemplate(
+            name: "Speak",
+            questionFormat: "<div class=\"meta\">{{Topic}} · Speak</div><div class=\"prompt\">{{English}}</div><div class=\"cue\">{{Cue}}</div>",
+            answerFormat: "{{FrontSide}}<hr><div class=\"answer\">{{Portuguese}}</div>{{#ExamplePortuguese}}<div class=\"label\">Example</div>{{ExamplePortuguese}}{{ExampleEnglish}}{{/ExamplePortuguese}}",
+            ordinal: 1
+        )
+        let type = NoteType(id: 13, name: "Brazilian Portuguese - Everyday v2", fieldNames: names, templates: [understand, speak], kind: .standard)
+        let note = Note(id: 1, noteTypeID: 13, fields: fields, tags: [], guid: "g")
+        let deck = Deck(id: 1, name: "Portuguese", fullName: "Portuguese - Everyday Brazilian Portuguese v2", parentID: nil)
+        func card(_ ordinal: Int) -> StudyCard {
+            StudyCard(card: Card(id: Int64(ordinal + 1), noteID: 1, deckID: 1, templateOrdinal: ordinal), note: note, noteType: type, deck: deck)
+        }
+
+        let understandQ = engineText(renderer.render(card(0), questionLocale: "pt-BR", answerLocale: "en-US").question)
+        let understandA = engineText(renderer.render(card(0), questionLocale: "pt-BR", answerLocale: "en-US").answer)
+        XCTAssertEqual(understandQ, "Por favor.")
+        XCTAssertEqual(understandA, "Please.")
+
+        let speakQ = engineText(renderer.render(card(1), questionLocale: "en-US", answerLocale: "pt-BR").question)
+        let speakA = engineText(renderer.render(card(1), questionLocale: "en-US", answerLocale: "pt-BR").answer)
+        XCTAssertEqual(speakQ, "Please.")
+        XCTAssertFalse(speakQ.contains("Asking for things"))
+        XCTAssertFalse(speakQ.contains("Say this in Brazilian Portuguese"))
+        XCTAssertEqual(speakA, "Por favor.")
+        XCTAssertFalse(speakA.contains("Um café"))
+    }
+
     /// Core 2000-style templates bury the word under an index, part of speech,
     /// notes, and a static "about this deck" caption. Voice reads the word
     /// and the meaning only.
@@ -309,6 +381,54 @@ final class SpeechRendererTests: XCTestCase {
         XCTAssertTrue(answer.html.contains("け"))
         XCTAssertTrue(answer.html.contains("ke"))
         XCTAssertFalse(answer.html.contains("[sound:"))
+    }
+}
+
+final class SpokenFieldPlannerTests: XCTestCase {
+
+    func testRepeatedTopicIsSkippedAndTheChangingLineIsRead() {
+        let question = "<div class=\"meta\">{{Topic}} · Understand</div><div class=\"prompt\">{{Portuguese}}</div>"
+        let answer = "{{FrontSide}}<hr>{{English}}{{#ExamplePortuguese}}{{ExamplePortuguese}}{{/ExamplePortuguese}}"
+        var samples: [String: [String]] = [
+            "Topic": [], "Portuguese": [], "English": [], "ExamplePortuguese": [], "Cue": [],
+        ]
+        let phrases = ["Por favor.", "Obrigado.", "Com licença.", "Desculpa.", "Eu queria um café."]
+        let english = ["Please.", "Thank you.", "Excuse me.", "Sorry.", "I'd like a coffee."]
+        for index in phrases.indices {
+            samples["Topic", default: []].append("Asking for things")
+            samples["Portuguese", default: []].append(phrases[index])
+            samples["English", default: []].append(english[index])
+            samples["ExamplePortuguese", default: []].append(index == 0 ? "Um café, por favor." : "")
+            samples["Cue", default: []].append("Say this in Brazilian Portuguese.")
+        }
+        XCTAssertEqual(
+            SpokenFieldPlanner.choose(shown: SpokenFieldPlanner.fields(in: question), samples: samples),
+            ["Portuguese"]
+        )
+        XCTAssertEqual(
+            SpokenFieldPlanner.choose(shown: SpokenFieldPlanner.fields(in: answer), samples: samples),
+            ["English"]
+        )
+        let speakQuestion = "<div class=\"meta\">{{Topic}} · Speak</div>{{English}}<div class=\"cue\">{{Cue}}</div>"
+        let speakAnswer = "{{Portuguese}}{{#ExamplePortuguese}}{{ExamplePortuguese}}{{/ExamplePortuguese}}"
+        XCTAssertEqual(
+            SpokenFieldPlanner.choose(shown: SpokenFieldPlanner.fields(in: speakQuestion), samples: samples),
+            ["English"]
+        )
+        XCTAssertEqual(
+            SpokenFieldPlanner.choose(shown: SpokenFieldPlanner.fields(in: speakAnswer), samples: samples),
+            ["Portuguese"]
+        )
+    }
+
+    func testANumberThatChangesEveryCardIsNotRead() {
+        let shown = SpokenFieldPlanner.fields(in: "Core {{Index}} {{Kanji}}")
+        var samples = ["Index": [String](), "Kanji": [String]()]
+        for n in 1...8 {
+            samples["Index", default: []].append("\(n)")
+            samples["Kanji", default: []].append("字\(n)")
+        }
+        XCTAssertEqual(SpokenFieldPlanner.choose(shown: shown, samples: samples), ["Kanji"])
     }
 }
 
